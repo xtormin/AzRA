@@ -1,5 +1,9 @@
 # AzRA - Azure Reconnaissance & Analysis
 
+<p align="center">
+  <img src="Images/azra_banner.jpeg" alt="AzRA Banner" width="100%">
+</p>
+
 Kit de herramientas PowerShell para reconocimiento y pruebas de seguridad en Azure y Microsoft 365.
 
 ## 📑 Índice
