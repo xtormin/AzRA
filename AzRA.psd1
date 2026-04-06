@@ -47,6 +47,8 @@ FunctionsToExport = @(
     'Get-AzRA-AutomationRunbooks',
     # Internal reconnaissance - Logic Apps
     'Get-AzRA-LogicApps',
+    # Internal reconnaissance - Storage
+    'Get-AzRA-StorageAccounts',
     # External reconnaissance
     'Invoke-O365EmailValidator'
 )

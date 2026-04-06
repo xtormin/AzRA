@@ -116,6 +116,9 @@ $graphToken = (az account get-access-token --resource https://graph.microsoft.co
 #### API de Azure Management — Logic Apps
 - `Get-AzRA-LogicApps` - Enumerar Logic Apps y escanear definiciones, parámetros y acciones HTTP en busca de secretos y superficie de ataque
 
+#### API de Azure Management — Storage
+- `Get-AzRA-StorageAccounts` - Enumerar Storage Accounts y auditar misconfiguraciones de seguridad, contenedores públicos y claves de acceso
+
 ### Ejemplos por Función
 
 #### 1. Request-AzRA-Nonce
@@ -671,6 +674,172 @@ $logicApps | Where-Object { $_.HasSecrets } | ForEach-Object {
     Write-Output "`n[$($_.ResourceGroup)] $($_.LogicAppName)"
     $_.SecretFindings | ForEach-Object {
         Write-Output "  [$($_.Source)/$($_.FindingType)] $($_.PropertyPath) → $($_.MatchedValue)"
+    }
+}
+```
+
+#### 14. Get-AzRA-StorageAccounts
+
+Enumera todas las Storage Accounts accesibles, evalúa cada una contra un conjunto de checks de seguridad críticos, altos e informativos, detecta contenedores con acceso público y opcionalmente extrae las claves de acceso.
+
+**Cómo funciona:**
+
+1. Itera sobre todas las suscripciones accesibles (o una específica)
+2. Lista todas las Storage Accounts de cada suscripción (con paginación ARM)
+3. Por cada cuenta evalúa los checks de seguridad directamente desde `properties`
+4. Lista todos los contenedores blob de la cuenta (con paginación)
+5. Para contenedores con acceso `Container` (nivel más alto): realiza **listado anónimo de blobs** sin token para demostrar el impacto real
+6. Si `-ScanSecrets` y shared key access está habilitado: extrae las claves de acceso via POST `listKeys`
+7. Opcionalmente vuelca los JSONs a disco y exporta CSVs con timestamp
+8. Devuelve un objeto por cuenta al pipeline
+
+**Retry automático:** ante errores HTTP 429 (throttling) o errores transitorios 5xx, reintenta con backoff lineal.
+
+**Permisos requeridos:**
+- `Microsoft.Storage/storageAccounts/read`
+- `Microsoft.Storage/storageAccounts/blobServices/containers/read`
+- `Microsoft.Storage/storageAccounts/listkeys/action` (solo para `-ScanSecrets`)
+
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Enumerar todas las cuentas (metadatos y checks de seguridad al pipeline)
+Get-AzRA-StorageAccounts -AccessToken $token
+
+# Escanear solo una suscripción
+Get-AzRA-StorageAccounts -AccessToken $token -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+
+# Volcar JSONs y exportar CSV de metadatos
+Get-AzRA-StorageAccounts -AccessToken $token -OutputPath 'C:\Audit'
+# → C:\Audit\StorageAccountsRawDump\<Suscripcion>\<Cuenta>\account.json
+# → C:\Audit\StorageAccountsRawDump\<Suscripcion>\<Cuenta>\containers.json
+# → C:\Audit\AzRA-StorageAccounts_20250406-1530.csv
+
+# Extraer claves de acceso y connection strings
+Get-AzRA-StorageAccounts -AccessToken $token -OutputPath 'C:\Audit' -ScanSecrets
+# → C:\Audit\AzRA-StorageAccounts-Secrets_20250406-1530.csv
+
+# Filtrar cuentas con contenedores públicos (Container-level) y ver blobs expuestos
+Get-AzRA-StorageAccounts -AccessToken $token |
+    Where-Object { $_.HasPublicContainers } |
+    Select-Object StorageAccountName, ResourceGroup, PublicContainerNames, AnonymousBlobCount, AnonymousBlobs
+
+# Filtrar cuentas con mayor riesgo: sin firewall Y shared key habilitado
+Get-AzRA-StorageAccounts -AccessToken $token |
+    Where-Object { $_.NoFirewall -and $_.SharedKeyAccessEnabled } |
+    Select-Object StorageAccountName, ResourceGroup, SubscriptionName
+
+# Ver todas las misconfiguraciones ordenadas por criticidad
+Get-AzRA-StorageAccounts -AccessToken $token |
+    Select-Object StorageAccountName, ResourceGroup,
+        HasPublicContainers, NoFirewall, SharedKeyAccessEnabled,
+        HttpsNotEnforced, WeakTlsVersion, NoKeyExpirationPolicy |
+    Sort-Object HasPublicContainers, NoFirewall -Descending | Format-Table
+```
+
+**Parámetros:**
+
+| Parámetro | Tipo | Descripción |
+|---|---|---|
+| `-AccessToken` | `string` | Token Bearer de Azure Management API (**obligatorio**) |
+| `-SubscriptionId` | `string` | Limita el escaneo a una suscripción. Si se omite, escanea todas |
+| `-OutputPath` | `string` | Carpeta de salida para JSONs y CSVs (nombres auto-generados con timestamp) |
+| `-ScanSecrets` | `switch` | Extrae las claves de acceso via `listKeys` (solo si shared key está habilitado) |
+| `-MaxRetries` | `int` | Máximo de reintentos ante throttling/errores 5xx (1-10). Default: 3 |
+| `-RetryDelaySec` | `int` | Segundos base entre reintentos, multiplicado por el número de intento (1-60). Default: 5 |
+
+**Checks de seguridad evaluados:**
+
+| Severidad | Campo | Condición de riesgo |
+|---|---|---|
+| **Crítico** | `HasPublicContainers` | Algún contenedor con `publicAccess = "Container"` (listado + lectura anónima sin token) |
+| **Crítico** | `HasBlobPublicContainers` | Algún contenedor con `publicAccess = "Blob"` (lectura si se conoce la URL) |
+| **Crítico** | `NoFirewall` | `networkAcls.defaultAction = "Allow"` — cualquier IP puede acceder |
+| **Crítico** | `SharedKeyAccessEnabled` | `allowSharedKeyAccess` no es `false` explícito (null = habilitado en cuentas antiguas) |
+| **Alto** | `HttpsNotEnforced` | `supportsHttpsTrafficOnly = false` — permite tráfico HTTP sin cifrar |
+| **Alto** | `WeakTlsVersion` | `minimumTlsVersion` es `TLS1_0` o `TLS1_1` |
+| **Alto** | `NoKeyExpirationPolicy` | `keyPolicy` es null — las claves no tienen rotación obligatoria |
+| **Alto** | `NoSasExpirationPolicy` | `sasPolicy` es null — los SAS tokens no tienen expiración forzada |
+| **Alto** | `BlobPublicAccessAllowedAtAccount` | `allowBlobPublicAccess = true` — la cuenta permite contenedores públicos |
+| **Info** | `FirewallBypassAzureServices` | El firewall permite bypass a servicios Azure |
+| **Info** | `NoCustomerManagedKeys` | Cifrado con claves de Microsoft, no del cliente |
+
+**Objeto devuelto por cuenta (pipeline):**
+
+| Campo | Descripción |
+|---|---|
+| `SubscriptionId` / `SubscriptionName` | Suscripción donde está la cuenta |
+| `ResourceGroup` | Resource group |
+| `StorageAccountName` | Nombre de la Storage Account |
+| `Location`, `Kind`, `Sku` | Región, tipo y SKU |
+| `CreationTime` | Fecha de creación |
+| `HasPublicContainers` / `HasBlobPublicContainers` | Flags de contenedores públicos |
+| `NoFirewall`, `SharedKeyAccessEnabled`, ... | Todos los checks de seguridad (bool) |
+| `MinimumTlsVersion`, `NetworkDefaultAction`, `EncryptionKeySource` | Valores raw de configuración |
+| `ContainerCount` / `PublicContainerCount` / `BlobPublicContainerCount` | Conteos de contenedores |
+| `PublicContainerNames` | Nombres de contenedores Container-level (comma-separated) |
+| `AnonymousBlobCount` / `AnonymousBlobs` | Blobs encontrados via listado anónimo sin token |
+| `KeyFindings` | Array de objetos `{KeyName, KeyValue, Permissions, ConnectionString}` si `-ScanSecrets` |
+| `HasKeyFindings` | `$true` si se extrajeron claves |
+| `RawFilePath` | Directorio del dump (`$null` si no se usó `-OutputPath`) |
+
+**Listado anónimo de blobs:**
+
+Cuando un contenedor tiene `publicAccess = "Container"`, la función llama automáticamente a `https://{account}.blob.core.windows.net/{container}?restype=container&comp=list&maxresults=100` **sin token de autenticación** para demostrar el impacto real. Los nombres de los blobs encontrados se incluyen en `AnonymousBlobs`. Si el listado falla (restricciones de red adicionales), se registra como `Write-Verbose` y no interrumpe el análisis.
+
+**Estructura de salida en disco (`-OutputPath`):**
+
+```
+<OutputPath>/
+  StorageAccountsRawDump/
+    <Suscripcion>/
+      <StorageAccount>/
+        account.json       ← ARM object completo de la cuenta
+        containers.json    ← lista de contenedores con publicAccess
+  AzRA-StorageAccounts_<timestamp>.csv
+  AzRA-StorageAccounts-Secrets_<timestamp>.csv   ← solo si -ScanSecrets
+```
+
+**CSV de secrets (`-ScanSecrets`):**
+
+| Campo | Descripción |
+|---|---|
+| `StorageAccountName` | Nombre de la cuenta |
+| `KeyName` | `key1` o `key2` |
+| `KeyValue` | Valor de la clave en texto claro |
+| `Permissions` | Permisos: `Full` |
+| `ConnectionString` | `DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net` |
+
+### Ejemplo de flujo de enumeración completo
+
+```powershell
+# 1. Importar módulo y obtener token
+Import-Module .\AzRA.psd1
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# 2. Escaneo completo
+$storage = Get-AzRA-StorageAccounts -AccessToken $token -OutputPath 'C:\Audit' -ScanSecrets
+Write-Output "Storage Accounts encontradas: $($storage.Count)"
+
+# 3. Resumen de criticidad
+Write-Output "`n--- Contenedores públicos (CRÍTICO) ---"
+$storage | Where-Object { $_.HasPublicContainers } |
+    Select-Object StorageAccountName, ResourceGroup, PublicContainerNames, AnonymousBlobCount |
+    Format-Table
+
+Write-Output "`n--- Sin firewall (CRÍTICO) ---"
+$storage | Where-Object { $_.NoFirewall } |
+    Select-Object StorageAccountName, ResourceGroup, SubscriptionName | Format-Table
+
+Write-Output "`n--- TLS débil o HTTPS no forzado (ALTO) ---"
+$storage | Where-Object { $_.WeakTlsVersion -or $_.HttpsNotEnforced } |
+    Select-Object StorageAccountName, MinimumTlsVersion, HttpsNotEnforced | Format-Table
+
+# 4. Ver claves extraídas
+$storage | Where-Object { $_.HasKeyFindings } | ForEach-Object {
+    Write-Output "`n[$($_.ResourceGroup)] $($_.StorageAccountName)"
+    $_.KeyFindings | ForEach-Object {
+        Write-Output "  $($_.KeyName): $($_.ConnectionString)"
     }
 }
 ```
