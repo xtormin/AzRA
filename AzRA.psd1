@@ -43,6 +43,8 @@ FunctionsToExport = @(
     'Request-AzRA-Nonce',
     # Internal reconnaissance - Az module
     'Get-AzRA-DeploymentParameterSecrets',
+    # Internal reconnaissance - Automation
+    'Get-AzRA-AutomationRunbooks',
     # External reconnaissance
     'Invoke-O365EmailValidator'
 )

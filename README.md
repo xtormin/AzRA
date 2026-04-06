@@ -110,6 +110,9 @@ $graphToken = (az account get-access-token --resource https://graph.microsoft.co
 #### Módulo Az (requiere Connect-AzAccount)
 - `Get-AzRA-DeploymentParameterSecrets` - Auditar el historial de deployments buscando credenciales en texto claro
 
+#### API de Azure Management — Automation
+- `Get-AzRA-AutomationRunbooks` - Descargar y escanear Runbooks de Azure Automation buscando credenciales hardcodeadas
+
 ### Ejemplos por Función
 
 #### 1. Request-AzRA-Nonce
@@ -385,6 +388,127 @@ $secrets | Group-Object 'Nombre suscripcion' | Select-Object Count, Name | Sort-
 
 # 4. Extraer solo los valores (para revisión manual)
 $secrets | ForEach-Object { $_.Parametros | ConvertFrom-Json } | Select-Object Name, Value, Type
+```
+
+#### 11. Get-AzRA-AutomationRunbooks
+
+Enumera todas las cuentas de Azure Automation accesibles, descarga el código fuente de cada Runbook y opcionalmente escanea el contenido buscando credenciales hardcodeadas.
+
+**Cómo funciona:**
+
+1. Itera sobre todas las suscripciones accesibles (o una específica)
+2. Por cada suscripción enumera todas las Automation Accounts via Azure Management API
+3. Por cada cuenta obtiene la lista de Runbooks (con paginación automática)
+4. Descarga el contenido de cada Runbook con retry automático ante throttling
+5. Opcionalmente guarda los archivos en disco con jerarquía por suscripción y cuenta
+6. Opcionalmente escanea el contenido buscando asignaciones de credenciales en texto claro
+7. Devuelve un objeto por Runbook al pipeline
+
+**Retry automático:** ante errores HTTP 429 (throttling) o errores transitorios 5xx, reintenta automáticamente con backoff lineal.
+
+**Permisos requeridos:**
+- `Microsoft.Automation/automationAccounts/read`
+- `Microsoft.Automation/automationAccounts/runbooks/read`
+- `Microsoft.Automation/automationAccounts/runbooks/content/read`
+
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Enumerar todos los Runbooks (solo metadatos al pipeline)
+Get-AzRA-AutomationRunbooks -AccessToken $token
+
+# Escanear solo una suscripción
+Get-AzRA-AutomationRunbooks -AccessToken $token -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+
+# Descargar archivos y exportar CSV de metadatos
+Get-AzRA-AutomationRunbooks -AccessToken $token -OutputPath 'C:\Audit'
+# → C:\Audit\AutomationRunbooks\<Suscripcion>\<Cuenta>\<Runbook>.ps1
+# → C:\Audit\AzRA-AutomationRunbooks_20250406-1530.csv
+
+# Descargar y escanear credenciales hardcodeadas
+Get-AzRA-AutomationRunbooks -AccessToken $token -OutputPath 'C:\Audit' -ScanSecrets
+# → C:\Audit\AzRA-AutomationRunbooks-Secrets_20250406-1530.csv
+
+# Filtrar en pipeline solo los Runbooks con secrets
+Get-AzRA-AutomationRunbooks -AccessToken $token -ScanSecrets |
+    Where-Object { $_.HasSecrets } |
+    Select-Object RunbookName, AutomationAccount, SecretFindings
+
+# Keywords personalizadas
+Get-AzRA-AutomationRunbooks -AccessToken $token -ScanSecrets `
+    -Keywords @('storageaccountkey', 'sqlpassword', 'clientsecret')
+```
+
+**Parámetros:**
+
+| Parámetro | Tipo | Descripción |
+|---|---|---|
+| `-AccessToken` | `string` | Token Bearer de Azure Management API (**obligatorio**) |
+| `-SubscriptionId` | `string` | Limita el escaneo a una suscripción. Si se omite, escanea todas |
+| `-OutputPath` | `string` | Carpeta de salida para archivos y CSVs (nombres auto-generados con timestamp) |
+| `-ScanSecrets` | `switch` | Activa el scanner de credenciales hardcodeadas en el contenido |
+| `-Keywords` | `string[]` | Keywords para detectar asignaciones sensibles. Default: `password, secret, key, token, credential, sas, connectionstring...` |
+| `-MaxRetries` | `int` | Máximo de reintentos ante throttling/errores 5xx (1-10). Default: 3 |
+| `-RetryDelaySec` | `int` | Segundos base entre reintentos, multiplicado por el número de intento (1-60). Default: 5 |
+
+**Objeto devuelto por Runbook (pipeline):**
+
+| Campo | Descripción |
+|---|---|
+| `SubscriptionId` / `SubscriptionName` | Suscripción donde está la cuenta |
+| `AutomationAccount` | Nombre de la Automation Account |
+| `ResourceGroup` | Resource group de la cuenta |
+| `RunbookName` | Nombre del Runbook |
+| `RunbookType` | Tipo: `PowerShell`, `PowerShell72`, `Python3`, etc. |
+| `RunbookState` | Estado: `Published`, `Draft` |
+| `LastModified` | Fecha de última modificación |
+| `ContentSizeBytes` | Tamaño del contenido en bytes |
+| `FilePath` | Ruta del archivo guardado (`$null` si no se usó `-OutputPath`) |
+| `SecretFindings` | Array de findings (`Keyword`, `Line`, `MatchedLine`). Vacío si `-ScanSecrets` no activo |
+| `HasSecrets` | `$true` si se encontró algún finding |
+
+**Estructura de salida en disco (`-OutputPath`):**
+
+```
+<OutputPath>/
+  AutomationRunbooks/
+    <Suscripcion>/
+      <AutomationAccount>/
+        <Runbook>.ps1 / .py / .txt    ← extensión según RunbookType
+  AzRA-AutomationRunbooks_<timestamp>.csv
+  AzRA-AutomationRunbooks-Secrets_<timestamp>.csv   ← solo si -ScanSecrets
+```
+
+**Scanner de secrets (`-ScanSecrets`):**
+
+Busca asignaciones del patrón `keyword = "valor"` o `keyword: 'valor'` (case-insensitive). Filtra automáticamente variables PowerShell (`$variable`) y valores triviales (`null`, `true`, `$null`) para reducir falsos positivos.
+
+### Ejemplo de flujo de enumeración completo
+
+```powershell
+# 1. Importar módulo
+Import-Module .\AzRA.psd1
+
+# 2. Obtener token
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# 3. Escaneo completo con descarga y búsqueda de secrets
+$runbooks = Get-AzRA-AutomationRunbooks -AccessToken $token -OutputPath 'C:\Audit' -ScanSecrets
+Write-Output "Runbooks encontrados: $($runbooks.Count)"
+
+# 4. Ver resumen de secrets por cuenta
+$runbooks | Where-Object { $_.HasSecrets } |
+    Group-Object AutomationAccount |
+    Select-Object Name, Count |
+    Sort-Object Count -Descending
+
+# 5. Ver todos los findings en detalle
+$runbooks | Where-Object { $_.HasSecrets } | ForEach-Object {
+    Write-Output "`n[$($_.AutomationAccount)] $($_.RunbookName)"
+    $_.SecretFindings | ForEach-Object {
+        Write-Output "  Line $($_.Line) [$($_.Keyword)]: $($_.MatchedLine)"
+    }
+}
 ```
 
 ## 🌐 Reconocimiento Externo (O365)

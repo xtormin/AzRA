@@ -50,19 +50,32 @@ function Invoke-AzRARequest {
         # Make initial request
         $Response = Invoke-RestMethod -Uri $Uri -Headers $Headers -Method $Method -ErrorAction Stop
 
-        # Handle pagination if enabled and nextLink exists
-        if ($EnablePagination -and $Response.PSObject.Properties.Name -contains '@odata.nextLink') {
-            $Results = @()
-            $Results += $Response.value
+        # Handle pagination if enabled — supports both Microsoft Graph (@odata.nextLink) and ARM (nextLink)
+        if ($EnablePagination) {
+            $hasOdataNext = $Response.PSObject.Properties.Name -contains '@odata.nextLink'
+            $hasArmNext   = $Response.PSObject.Properties.Name -contains 'nextLink'
 
-            # Follow pagination links
-            while ($Response.'@odata.nextLink') {
-                Write-Verbose "Following pagination link: $($Response.'@odata.nextLink')"
-                $Response = Invoke-RestMethod -Uri $Response.'@odata.nextLink' -Headers $Headers -Method $Method -ErrorAction Stop
-                $Results += $Response.value
+            if ($hasOdataNext -or $hasArmNext) {
+                $Results = [System.Collections.Generic.List[object]]::new()
+                if ($Response.value) { foreach ($item in $Response.value) { $Results.Add($item) } }
+
+                $nextLink = if ($hasOdataNext) { $Response.'@odata.nextLink' } else { $Response.nextLink }
+
+                while ($nextLink) {
+                    Write-Verbose "Following pagination link: $nextLink"
+                    $Response  = Invoke-RestMethod -Uri $nextLink -Headers $Headers -Method $Method -ErrorAction Stop
+                    if ($Response.value) { foreach ($item in $Response.value) { $Results.Add($item) } }
+                    $nextLink  = if ($Response.PSObject.Properties.Name -contains '@odata.nextLink') {
+                        $Response.'@odata.nextLink'
+                    } elseif ($Response.PSObject.Properties.Name -contains 'nextLink') {
+                        $Response.nextLink
+                    } else {
+                        $null
+                    }
+                }
+
+                return $Results.ToArray()
             }
-
-            return $Results
         }
 
         # Return value property if it exists, otherwise return full response
