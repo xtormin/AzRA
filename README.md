@@ -119,6 +119,12 @@ $graphToken = (az account get-access-token --resource https://graph.microsoft.co
 #### API de Azure Management — Storage
 - `Get-AzRA-StorageAccounts` - Enumerar Storage Accounts y auditar misconfiguraciones de seguridad, contenedores públicos y claves de acceso
 
+#### API de Azure Management — Key Vault
+- `Get-AzRA-KeyVaults` - Enumerar Key Vaults y auditar misconfiguraciones de seguridad, configuración de recuperación, acceso de red y políticas de autorización
+
+#### API de Azure Management — Virtual Machines
+- `Get-AzRA-VirtualMachines` - Enumerar Virtual Machines y SQL VMs auditando exposición de red, extensiones peligrosas, cifrado de disco y configuración de seguridad
+
 ### Ejemplos por Función
 
 #### 1. Request-AzRA-Nonce
@@ -842,6 +848,405 @@ $storage | Where-Object { $_.HasKeyFindings } | ForEach-Object {
         Write-Output "  $($_.KeyName): $($_.ConnectionString)"
     }
 }
+```
+
+#### 15. Get-AzRA-KeyVaults
+
+Enumera todos los Azure Key Vaults accesibles y los evalúa contra un conjunto de checks de seguridad críticos desde perspectiva de pentester, incluyendo configuración de recuperación, acceso de red, modelo de autorización y superficie de ataque expandida. Opcionalmente lista el inventario de secretos, claves y certificados vía Data Plane.
+
+**Cómo funciona:**
+
+1. Itera sobre todas las suscripciones accesibles (o una específica)
+2. Lista todos los Key Vaults de cada suscripción (con paginación ARM). **Nota:** el listado inicial no incluye `properties` completas — se hace una llamada adicional por vault para obtener `accessPolicies`, `networkAcls`, `softDelete`, etc.
+3. Por cada vault evalúa todos los checks de seguridad desde `properties`
+4. Llama al endpoint de Diagnostic Settings (non-fatal) para detectar ausencia de audit logging
+5. Si `-ScanSecrets` + `-VaultToken`: llama al Data Plane (`vault.azure.net`) para listar secretos, claves y certificados — solo metadatos (nombres, estado, expiración), **no valores**
+6. Opcionalmente vuelca los JSONs a disco y exporta CSVs con timestamp
+
+**Tokens necesarios:**
+- `-AccessToken`: scope `https://management.azure.com/` — Management Plane
+- `-VaultToken` (opcional, solo con `-ScanSecrets`): scope `https://vault.azure.net/` — Data Plane
+
+**Permisos requeridos:**
+- `Microsoft.KeyVault/vaults/read`
+- `Microsoft.Insights/diagnosticSettings/read` (opcional — non-fatal si falta)
+- Data Plane: `Secret List`, `Key List`, `Certificate List` (solo con `-ScanSecrets`)
+
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Enumerar todos los vaults (management plane, sin data plane)
+Get-AzRA-KeyVaults -AccessToken $token
+
+# Escanear solo una suscripción
+Get-AzRA-KeyVaults -AccessToken $token -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+
+# Volcar JSONs y exportar CSV
+Get-AzRA-KeyVaults -AccessToken $token -OutputPath 'C:\Audit'
+# → C:\Audit\KeyVaultsRawDump\<Suscripcion>\<Vault>\vault.json
+# → C:\Audit\KeyVaultsRawDump\<Suscripcion>\<Vault>\diagnostics.json
+# → C:\Audit\AzRA-KeyVaults_20250406-1530.csv
+
+# Data plane: listar inventario de secretos/claves/certificados (requiere vault token)
+$vaultToken = (az account get-access-token --resource https://vault.azure.net/ | ConvertFrom-Json).accessToken
+Get-AzRA-KeyVaults -AccessToken $token -VaultToken $vaultToken -ScanSecrets -OutputPath 'C:\Audit'
+# → C:\Audit\AzRA-KeyVaults-Secrets_20250406-1530.csv
+
+# Filtrar vaults con misconfiguraciones críticas
+Get-AzRA-KeyVaults -AccessToken $token |
+    Where-Object { $_.NotRecoverable -or $_.PublicNetworkAccess -or $_.LegacyAccessPolicies } |
+    Select-Object VaultName, ResourceGroup, NotRecoverable, PublicNetworkAccess, LegacyAccessPolicies
+
+# Filtrar vaults con access policies excesivamente permisivas
+Get-AzRA-KeyVaults -AccessToken $token |
+    Where-Object { $_.OverlyPermissiveAccessPolicies } |
+    Select-Object VaultName, ResourceGroup, AccessPolicyCount, RbacEnabled
+
+# Filtrar vaults que expanden la superficie de ataque (deployment/disk/template)
+Get-AzRA-KeyVaults -AccessToken $token |
+    Where-Object { $_.EnabledForDeployment -or $_.EnabledForTemplateDeployment } |
+    Select-Object VaultName, ResourceGroup, EnabledForDeployment, EnabledForTemplateDeployment
+
+# Filtrar por secretos expirados (solo con -ScanSecrets -VaultToken)
+Get-AzRA-KeyVaults -AccessToken $token -VaultToken $vaultToken -ScanSecrets |
+    Where-Object { $_.HasExpiredSecrets } |
+    Select-Object VaultName, ResourceGroup, SecretCount
+```
+
+**Parámetros:**
+
+| Parámetro | Tipo | Descripción |
+|---|---|---|
+| `-AccessToken` | `string` | Token Bearer de Azure Management API (**obligatorio**) |
+| `-SubscriptionId` | `string` | Limita el escaneo a una suscripción. Si se omite, escanea todas |
+| `-OutputPath` | `string` | Carpeta de salida para JSONs y CSVs (nombres auto-generados con timestamp) |
+| `-VaultToken` | `string` | Token Bearer de Key Vault Data Plane (`https://vault.azure.net/`). Requerido con `-ScanSecrets` |
+| `-ScanSecrets` | `switch` | Activa el listado de secretos/claves/certificados via Data Plane (requiere `-VaultToken`) |
+| `-MaxRetries` | `int` | Máximo de reintentos ante throttling/errores 5xx (1-10). Default: 3 |
+| `-RetryDelaySec` | `int` | Segundos base entre reintentos, multiplicado por el número de intento (1-60). Default: 5 |
+
+**Checks de seguridad evaluados:**
+
+| Severidad | Campo | Condición de riesgo |
+|---|---|---|
+| **Crítico** | `NotRecoverable` | `SoftDeleteDisabled` OR `PurgeProtectionDisabled` — los secretos se pueden eliminar permanentemente |
+| **Crítico** | `SoftDeleteDisabled` | `enableSoftDelete != true` — sin periodo de retención ante borrado accidental/malicioso |
+| **Crítico** | `PurgeProtectionDisabled` | `enablePurgeProtection != true` — borrado definitivo posible sin esperar retención |
+| **Crítico** | `PublicNetworkAccess` | Red pública habilitada (`Enabled`) Y sin firewall (`networkAcls.defaultAction = Allow`) |
+| **Crítico** | `LegacyAccessPolicies` | `enableRbacAuthorization != true` — usa Access Policies (vault-based), no RBAC de Azure |
+| **Alto** | `OverlyPermissiveAccessPolicies` | Alguna policy tiene `"all"` o ≥ 8 permisos en secrets/keys/certificates |
+| **Alto** | `EnabledForDeployment` | Las VMs pueden recuperar secretos del vault como parte de su provisioning |
+| **Alto** | `EnabledForDiskEncryption` | El servicio Azure Disk Encryption puede leer claves del vault |
+| **Alto** | `EnabledForTemplateDeployment` | Los ARM templates pueden recuperar secretos durante el despliegue |
+| **Alto** | `WeakSoftDeleteRetention` | `softDeleteRetentionInDays < 30` — ventana de recuperación insuficiente |
+| **Alto** | `NoFirewall` | `networkAcls.defaultAction = Allow` — sin restricción de red configurada |
+| **Alto** | `NoDiagnosticSettings` | Sin diagnostic settings — no hay audit logging de accesos al vault |
+| **Info** | `FirewallBypassAzureServices` | El firewall permite bypass a Azure Services |
+| **Info** | `NoPrivateEndpoint` | Sin private endpoint configurado |
+| **Info** | `StandardSku` | SKU Standard en lugar de Premium (sin HSM hardware) |
+
+**Objeto devuelto por vault (pipeline):**
+
+| Campo | Descripción |
+|---|---|
+| `SubscriptionId` / `SubscriptionName` | Suscripción |
+| `ResourceGroup` | Resource group |
+| `VaultName`, `Location`, `Sku`, `VaultUri`, `TenantId` | Identidad del vault |
+| `NotRecoverable`, `SoftDeleteDisabled`, `PurgeProtectionDisabled` | Checks críticos de recuperación |
+| `PublicNetworkAccess`, `LegacyAccessPolicies` | Checks críticos de acceso |
+| `OverlyPermissiveAccessPolicies`, `EnabledForDeployment/DiskEncryption/TemplateDeployment` | Checks altos |
+| `WeakSoftDeleteRetention`, `NoFirewall`, `NoDiagnosticSettings` | Checks altos |
+| `FirewallBypassAzureServices`, `NoPrivateEndpoint`, `StandardSku` | Checks informativos |
+| `SoftDeleteRetentionDays`, `NetworkDefaultAction`, `NetworkBypass` | Valores raw de configuración |
+| `AccessPolicyCount`, `RbacEnabled`, `PublicNetworkAccessRaw` | Valores raw de autorización |
+| `SecretCount` | Número de secretos/claves/certificados (solo con `-ScanSecrets -VaultToken`) |
+| `SecretItems` | Array de `{ItemType, ItemName, Enabled, Expires, ContentType}` |
+| `HasExpiredSecrets` | `$true` si algún secreto/clave ha expirado |
+| `RawFilePath` | Directorio del dump (`$null` si no se usó `-OutputPath`) |
+
+**Nota sobre el token de Data Plane:**
+
+El token de Azure Management API y el token de Key Vault Data Plane tienen **scopes distintos** y no son intercambiables. Para activar `-ScanSecrets` se necesitan ambos tokens:
+
+```powershell
+$token      = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+$vaultToken = (az account get-access-token --resource https://vault.azure.net/ | ConvertFrom-Json).accessToken
+```
+
+El Data Plane solo devuelve **metadatos** (nombre, estado enabled/disabled, fecha de expiración). Los valores reales de los secretos NO se recuperan.
+
+**Estructura de salida en disco (`-OutputPath`):**
+
+```
+<OutputPath>/
+  KeyVaultsRawDump/
+    <Suscripcion>/
+      <VaultName>/
+        vault.json           ← ARM object completo (ConvertTo-Json -Depth 20)
+        diagnostics.json     ← diagnostic settings (si se obtuvo)
+  AzRA-KeyVaults_<timestamp>.csv
+  AzRA-KeyVaults-Secrets_<timestamp>.csv   ← solo si -ScanSecrets + -VaultToken
+```
+
+**CSV de data plane (`-ScanSecrets -VaultToken`):**
+
+| Campo | Descripción |
+|---|---|
+| `VaultName` | Nombre del vault |
+| `ItemType` | `secret`, `key` o `certificate` |
+| `ItemName` | Nombre del item |
+| `ItemId` | URI completo del item en el data plane |
+| `Enabled` | `$true` / `$false` |
+| `Expires` | Fecha de expiración (UTC) o `$null` si no tiene |
+| `ContentType` | Content type del secreto (si aplica) |
+
+### Ejemplo de flujo de enumeración completo
+
+```powershell
+# 1. Importar módulo y obtener tokens
+Import-Module .\AzRA.psd1
+$token      = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+$vaultToken = (az account get-access-token --resource https://vault.azure.net/ | ConvertFrom-Json).accessToken
+
+# 2. Escaneo completo con data plane
+$vaults = Get-AzRA-KeyVaults -AccessToken $token -VaultToken $vaultToken -ScanSecrets -OutputPath 'C:\Audit'
+Write-Output "Key Vaults encontrados: $($vaults.Count)"
+
+# 3. Resumen por severidad
+Write-Output "`n--- CRÍTICO: No recuperables ---"
+$vaults | Where-Object { $_.NotRecoverable } |
+    Select-Object VaultName, ResourceGroup, SoftDeleteDisabled, PurgeProtectionDisabled | Format-Table
+
+Write-Output "`n--- CRÍTICO: Acceso de red público ---"
+$vaults | Where-Object { $_.PublicNetworkAccess } |
+    Select-Object VaultName, ResourceGroup, NetworkDefaultAction | Format-Table
+
+Write-Output "`n--- CRÍTICO: Access Policies (no RBAC) ---"
+$vaults | Where-Object { $_.LegacyAccessPolicies } |
+    Select-Object VaultName, ResourceGroup, AccessPolicyCount, OverlyPermissiveAccessPolicies | Format-Table
+
+Write-Output "`n--- ALTO: Superficie de ataque expandida ---"
+$vaults | Where-Object { $_.EnabledForDeployment -or $_.EnabledForTemplateDeployment -or $_.EnabledForDiskEncryption } |
+    Select-Object VaultName, ResourceGroup, EnabledForDeployment, EnabledForDiskEncryption, EnabledForTemplateDeployment | Format-Table
+
+# 4. Inventario de secretos expirados
+$vaults | Where-Object { $_.HasExpiredSecrets } | ForEach-Object {
+    Write-Output "`n[$($_.ResourceGroup)] $($_.VaultName)"
+    $_.SecretItems | Where-Object { $_.Expires -and $_.Expires -lt (Get-Date) } | ForEach-Object {
+        Write-Output "  [$($_.ItemType)] $($_.ItemName) — expiró: $($_.Expires)"
+    }
+}
+```
+
+#### 16. Get-AzRA-VirtualMachines
+
+Enumera todas las Azure Virtual Machines y SQL Server on Azure VMs (IaaS) accesibles, evalúa cada una contra checks de seguridad críticos y detecta exposición real de red correlacionando la cadena VM → NIC → IP Pública → NSG. Las SQL VMs se correlacionan automáticamente con su VM subyacente enriqueciendo el mismo objeto de resultado.
+
+**Cómo funciona:**
+
+1. Itera sobre todas las suscripciones accesibles (o una específica)
+2. Pre-carga el índice de SQL VMs por suscripción (una sola llamada API) para correlación posterior
+3. Lista todas las Compute VMs de la suscripción (con paginación ARM)
+4. Por cada VM:
+   - Lista las extensiones instaladas
+   - Resuelve la cadena NIC → Public IP para detectar IPs públicas reales
+   - Obtiene reglas NSG asociadas a cada NIC para evaluar puertos abiertos (RDP, SSH, WinRM, SQL)
+   - Correlaciona con el índice de SQL VMs usando el ARM ID
+   - Si `-IncludeInstanceView`: llama al endpoint `/instanceView` para obtener `PowerState` y detalles del OS
+5. Evalúa todos los checks de seguridad
+6. Opcionalmente vuelca JSON a disco y exporta CSV
+
+**Retry automático:** ante errores HTTP 429 (throttling) o errores transitorios 5xx, reintenta con backoff lineal.
+
+**Permisos requeridos:**
+- `Microsoft.Compute/virtualMachines/read`
+- `Microsoft.Compute/virtualMachines/extensions/read`
+- `Microsoft.SqlVirtualMachine/sqlVirtualMachines/read`
+- `Microsoft.Network/networkInterfaces/read`
+- `Microsoft.Network/publicIPAddresses/read`
+- `Microsoft.Network/networkSecurityGroups/read`
+
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Enumerar todas las VMs (checks de seguridad y exposición de red al pipeline)
+Get-AzRA-VirtualMachines -AccessToken $token
+
+# Escanear solo una suscripción
+Get-AzRA-VirtualMachines -AccessToken $token -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+
+# Volcar JSONs y exportar CSV
+Get-AzRA-VirtualMachines -AccessToken $token -OutputPath 'C:\Audit'
+# → C:\Audit\VirtualMachinesRawDump\<Suscripcion>\<VM>\vm.json
+# → C:\Audit\VirtualMachinesRawDump\<Suscripcion>\<VM>\extensions.json
+# → C:\Audit\VirtualMachinesRawDump\<Suscripcion>\<VM>\network.json
+# → C:\Audit\VirtualMachinesRawDump\<Suscripcion>\<VM>\sqlvm.json  (si SQL VM)
+# → C:\Audit\AzRA-VirtualMachines_20250406-1530.csv
+
+# Con instance view (PowerState + OS name — más lento a escala)
+Get-AzRA-VirtualMachines -AccessToken $token -IncludeInstanceView
+
+# Filtrar VMs con RDP o SSH expuesto a internet
+Get-AzRA-VirtualMachines -AccessToken $token |
+    Where-Object { $_.RdpExposed -or $_.SshExposed } |
+    Select-Object VmName, ResourceGroup, OsType, PublicIpAddresses, OpenInboundPorts
+
+# Filtrar VMs con extensiones de RCE instaladas
+Get-AzRA-VirtualMachines -AccessToken $token |
+    Where-Object { $_.CustomScriptExtension -or $_.RunCommandExtension } |
+    Select-Object VmName, ResourceGroup, InstalledExtensions
+
+# Filtrar VMs con IP pública y sin NSG (exposición desconocida)
+Get-AzRA-VirtualMachines -AccessToken $token |
+    Where-Object { $_.HasPublicIp -and $_.OpenInboundPorts -eq 'unknown (no NSG)' } |
+    Select-Object VmName, ResourceGroup, PublicIpAddresses
+
+# Filtrar SQL VMs con conectividad pública o auth mixta
+Get-AzRA-VirtualMachines -AccessToken $token |
+    Where-Object { $_.IsSqlVm -and ($_.SqlPublicConnectivity -or $_.SqlMixedAuthEnabled) } |
+    Select-Object VmName, ResourceGroup, SqlImageSku, SqlConnectivity, PublicIpAddresses
+
+# VMs sin identidad administrada (usan credenciales almacenadas)
+Get-AzRA-VirtualMachines -AccessToken $token |
+    Where-Object { $_.NoManagedIdentity } |
+    Select-Object VmName, ResourceGroup, OsType, ManagedIdentityType
+
+# Ver todas las misconfiguraciones críticas
+Get-AzRA-VirtualMachines -AccessToken $token |
+    Where-Object { $_.HasPublicIp -or $_.CustomScriptExtension -or $_.OsDiskNotEncrypted } |
+    Select-Object VmName, ResourceGroup, HasPublicIp, RdpExposed, SshExposed,
+        CustomScriptExtension, OsDiskNotEncrypted |
+    Sort-Object HasPublicIp, RdpExposed -Descending | Format-Table
+```
+
+**Parámetros:**
+
+| Parámetro | Tipo | Descripción |
+|---|---|---|
+| `-AccessToken` | `string` | Token Bearer de Azure Management API (**obligatorio**) |
+| `-SubscriptionId` | `string` | Limita el escaneo a una suscripción. Si se omite, escanea todas |
+| `-OutputPath` | `string` | Carpeta de salida para JSONs y CSV (nombre auto-generado con timestamp) |
+| `-IncludeInstanceView` | `switch` | Activa la llamada adicional `/instanceView` por VM para obtener `PowerState` y detalles del OS. Desactivado por defecto (coste significativo a escala) |
+| `-MaxRetries` | `int` | Máximo de reintentos ante throttling/errores 5xx (1-10). Default: 3 |
+| `-RetryDelaySec` | `int` | Segundos base entre reintentos, multiplicado por el número de intento (1-60). Default: 5 |
+
+**Checks de seguridad evaluados:**
+
+| Severidad | Campo | Condición de riesgo |
+|---|---|---|
+| **Crítico** | `HasPublicIp` | La VM tiene al menos una IP pública asignada |
+| **Crítico** | `RdpExposed` | IP pública + NSG permite inbound puerto 3389 desde 0.0.0.0/0 |
+| **Crítico** | `SshExposed` | IP pública + NSG permite inbound puerto 22 desde 0.0.0.0/0 |
+| **Crítico** | `WinRmExposed` | IP pública + NSG permite inbound puertos 5985/5986 desde internet |
+| **Crítico** | `SqlPortExposed` | IP pública + NSG permite inbound puerto 1433 desde internet |
+| **Crítico** | `CustomScriptExtension` | Extension `CustomScriptExtension` instalada — puede ejecutar scripts arbitrarios |
+| **Crítico** | `RunCommandExtension` | Extension `RunCommandWindows/Linux` instalada — RCE directo |
+| **Crítico** | `SqlMixedAuthEnabled` | SQL VM con autenticación mixta (SQL auth habilitada, no solo Windows) |
+| **Crítico** | `SqlPublicConnectivity` | SQL VM con `sqlConnectivity = "PUBLIC"` — SQL Server accesible desde internet |
+| **Alto** | `OsDiskNotEncrypted` | Disco OS sin Customer-Managed Key (CMK) asignado |
+| **Alto** | `DataDiskNotEncrypted` | Algún disco de datos sin CMK |
+| **Alto** | `EncryptionAtHostDisabled` | Cifrado a nivel de hipervisor no habilitado (discos temporales sin cifrar) |
+| **Alto** | `SecureBootDisabled` | Secure Boot no habilitado (Trusted Launch no configurado) |
+| **Alto** | `VtpmDisabled` | Virtual TPM no habilitado |
+| **Alto** | `AadLoginNotConfigured` | Extension AAD Login no instalada — sin autenticación centralizada con MFA |
+| **Alto** | `NoManagedIdentity` | Sin identidad administrada — la VM usa credenciales almacenadas |
+| **Alto** | `BootDiagnosticsEnabled` | Boot diagnostics activo (escritura a storage account no cifrado con CMK) |
+| **Alto** | `SqlEolVersion` | SQL VM con versión EOL: SQL Server 2008, 2012 o 2014 |
+| **Alto** | `SqlNoBackup` | SQL VM sin configuración de backup automático |
+| **Alto** | `MmaInstalled` | Microsoft Monitoring Agent / OMS Agent instalado |
+| **Info** | `NoTags` | Sin tags — dificulta inventario y atribución |
+| **Info** | `IsSpotInstance` | VM de tipo Spot (puede ser eviccionada) |
+| **Info** | `EphemeralOsDisk` | Disco OS efímero (sin persistencia) |
+| **Info** | `SingleNic` | Una sola interfaz de red |
+
+**Objeto devuelto por VM (pipeline):**
+
+| Campo | Descripción |
+|---|---|
+| `SubscriptionId` / `SubscriptionName` | Suscripción |
+| `ResourceGroup` | Resource group |
+| `VmName`, `VmId`, `Location`, `OsType`, `VmSize` | Identidad de la VM |
+| `OsImagePublisher`, `OsImageOffer`, `OsImageSku` | Imagen del OS |
+| `PowerState`, `OsName` | Estado de encendido y nombre del OS (solo con `-IncludeInstanceView`) |
+| `ProvisioningState` | Estado de aprovisionamiento |
+| `HasPublicIp`, `RdpExposed`, `SshExposed`, `WinRmExposed`, `SqlPortExposed` | Checks críticos de red |
+| `CustomScriptExtension`, `RunCommandExtension` | Checks críticos de extensiones |
+| `SqlMixedAuthEnabled`, `SqlPublicConnectivity` | Checks críticos de SQL |
+| `OsDiskNotEncrypted`, `DataDiskNotEncrypted`, `EncryptionAtHostDisabled` | Checks altos de cifrado |
+| `SecureBootDisabled`, `VtpmDisabled` | Checks altos de Trusted Launch |
+| `AadLoginNotConfigured`, `NoManagedIdentity`, `BootDiagnosticsEnabled`, `MmaInstalled` | Checks altos de identidad |
+| `SqlEolVersion`, `SqlNoBackup` | Checks altos de SQL |
+| `NoTags`, `IsSpotInstance`, `EphemeralOsDisk`, `SingleNic` | Checks informativos |
+| `PublicIpAddresses` | IPs públicas asignadas (comma-separated) |
+| `PrivateIpAddresses` | IPs privadas (comma-separated) |
+| `NicCount` | Número de interfaces de red |
+| `InstalledExtensions` | Tipos de extensiones instaladas (comma-separated) |
+| `OpenInboundPorts` | Puertos abiertos desde internet (ej. `"22,3389"`) o `"unknown (no NSG)"` |
+| `ManagedIdentityType` | `None`, `SystemAssigned`, `UserAssigned` o `Both` |
+| `DataDiskCount` | Número de discos de datos |
+| `IsSqlVm` | `$true` si la VM tiene el SQL VM provider overlay |
+| `SqlImageSku`, `SqlLicenseType`, `SqlConnectivity`, `SqlManagementMode` | Metadatos SQL (si `IsSqlVm`) |
+| `RawFilePath` | Directorio del dump (`$null` si no se usó `-OutputPath`) |
+
+**Correlación VM → NIC → IP Pública → NSG:**
+
+La función resuelve automáticamente la cadena completa de recursos de red para cada VM. Por cada NIC en `networkProfile.networkInterfaces`:
+1. Recupera la NIC completa via ARM ID
+2. Sigue las referencias `publicIPAddress.id` para obtener las IPs públicas reales
+3. Obtiene las reglas NSG asociadas a la NIC y evalúa puertos peligrosos
+
+Si una VM tiene IP pública pero no tiene NSG asociada a ninguna NIC, `OpenInboundPorts` se marca como `"unknown (no NSG)"` para indicar que la exposición no pudo evaluarse (posiblemente solo protegida por Azure Firewall o sin protección).
+
+**Estructura de salida en disco (`-OutputPath`):**
+
+```
+<OutputPath>/
+  VirtualMachinesRawDump/
+    <Suscripcion>/
+      <VmName>/
+        vm.json            ← ARM object completo de la VM
+        extensions.json    ← lista de extensiones instaladas
+        network.json       ← NICs con IPs y NSGs
+        sqlvm.json         ← SQL VM object (solo si IsSqlVm)
+  AzRA-VirtualMachines_<timestamp>.csv
+```
+
+### Ejemplo de flujo de enumeración completo
+
+```powershell
+# 1. Importar módulo y obtener token
+Import-Module .\AzRA.psd1
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# 2. Escaneo completo con instance view
+$vms = Get-AzRA-VirtualMachines -AccessToken $token -IncludeInstanceView -OutputPath 'C:\Audit'
+Write-Output "VMs encontradas: $($vms.Count)"
+Write-Output "SQL VMs: $(($vms | Where-Object { $_.IsSqlVm }).Count)"
+
+# 3. Resumen de exposición de red
+Write-Output "`n--- CRÍTICO: VMs con RDP/SSH abierto a internet ---"
+$vms | Where-Object { $_.RdpExposed -or $_.SshExposed } |
+    Select-Object VmName, ResourceGroup, OsType, PublicIpAddresses, OpenInboundPorts | Format-Table
+
+# 4. Extensiones peligrosas
+Write-Output "`n--- CRÍTICO: VMs con extensiones de ejecución remota ---"
+$vms | Where-Object { $_.CustomScriptExtension -or $_.RunCommandExtension } |
+    Select-Object VmName, ResourceGroup, InstalledExtensions | Format-Table
+
+# 5. SQL VMs vulnerables
+Write-Output "`n--- CRÍTICO: SQL VMs con conectividad pública o auth mixta ---"
+$vms | Where-Object { $_.IsSqlVm -and ($_.SqlPublicConnectivity -or $_.SqlEolVersion) } |
+    Select-Object VmName, ResourceGroup, SqlImageSku, SqlConnectivity | Format-Table
+
+# 6. VMs con mayor superficie de ataque
+$vms |
+    Select-Object VmName, ResourceGroup,
+        @{N='CriticalCount'; E={
+            @($_.HasPublicIp, $_.RdpExposed, $_.SshExposed, $_.WinRmExposed,
+              $_.CustomScriptExtension, $_.RunCommandExtension) |
+            Where-Object { $_ -eq $true } | Measure-Object | Select-Object -Expand Count
+        }} |
+    Sort-Object CriticalCount -Descending | Format-Table
 ```
 
 ## 🌐 Reconocimiento Externo (O365)
