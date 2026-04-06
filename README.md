@@ -113,6 +113,9 @@ $graphToken = (az account get-access-token --resource https://graph.microsoft.co
 #### API de Azure Management — Automation
 - `Get-AzRA-AutomationRunbooks` - Descargar y escanear Runbooks de Azure Automation buscando credenciales hardcodeadas
 
+#### API de Azure Management — Logic Apps
+- `Get-AzRA-LogicApps` - Enumerar Logic Apps y escanear definiciones, parámetros y acciones HTTP en busca de secretos y superficie de ataque
+
 ### Ejemplos por Función
 
 #### 1. Request-AzRA-Nonce
@@ -507,6 +510,167 @@ $runbooks | Where-Object { $_.HasSecrets } | ForEach-Object {
     Write-Output "`n[$($_.AutomationAccount)] $($_.RunbookName)"
     $_.SecretFindings | ForEach-Object {
         Write-Output "  Line $($_.Line) [$($_.Keyword)]: $($_.MatchedLine)"
+    }
+}
+```
+
+#### 13. Get-AzRA-LogicApps
+
+Enumera todas las Logic Apps accesibles, descarga su definición completa (triggers, acciones, parámetros del workflow) y opcionalmente las escanea en busca de credenciales hardcodeadas, endpoints expuestos y configuraciones sensibles.
+
+**Cómo funciona:**
+
+1. Itera sobre todas las suscripciones accesibles (o una específica)
+2. Lista todas las Logic Apps de cada suscripción via Azure Management API (con paginación)
+3. Descarga la definición completa de cada Logic App con retry automático ante throttling
+4. Opcionalmente vuelca el JSON completo a disco en jerarquía por suscripción y RG
+5. Opcionalmente escanea 4 fuentes en busca de información sensible (ver abajo)
+6. Opcionalmente recupera y analiza el historial de versiones de cada Logic App
+7. Devuelve un objeto por Logic App al pipeline con metadatos de superficie de ataque
+
+**Retry automático:** ante errores HTTP 429 (throttling) o errores transitorios 5xx, reintenta con backoff lineal.
+
+**Permisos requeridos:**
+- `Microsoft.Logic/workflows/read`
+
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Enumerar todas las Logic Apps (metadatos y superficie de ataque al pipeline)
+Get-AzRA-LogicApps -AccessToken $token
+
+# Escanear solo una suscripción
+Get-AzRA-LogicApps -AccessToken $token -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+
+# Volcar JSONs y exportar CSV de metadatos
+Get-AzRA-LogicApps -AccessToken $token -OutputPath 'C:\Audit'
+# → C:\Audit\LogicAppsRawDump\<Suscripcion>\<ResourceGroup>\<LogicApp>.json
+# → C:\Audit\AzRA-LogicApps_20250406-1530.csv
+
+# Escaneo completo con búsqueda de secrets
+Get-AzRA-LogicApps -AccessToken $token -OutputPath 'C:\Audit' -ScanSecrets
+# → C:\Audit\AzRA-LogicApps-Secrets_20250406-1530.csv
+
+# Incluir historial de versiones en el análisis
+Get-AzRA-LogicApps -AccessToken $token -OutputPath 'C:\Audit' -ScanSecrets -IncludeVersions
+# → C:\Audit\LogicAppsRawDump\<Sub>\<RG>\<LogicApp>_versions.json
+
+# Filtrar Logic Apps con triggers expuestos al exterior (tipo Request)
+Get-AzRA-LogicApps -AccessToken $token |
+    Where-Object { $_.HasExposedTrigger } |
+    Select-Object LogicAppName, ResourceGroup, TriggerTypes, ExposedEndpoints
+
+# Filtrar Logic Apps con parámetros SecureString (credenciales declaradas)
+Get-AzRA-LogicApps -AccessToken $token |
+    Where-Object { $_.SecureStringParamCount -gt 0 } |
+    Select-Object LogicAppName, ResourceGroup, SecureStringParamCount
+
+# Filtrar Logic Apps con findings de secrets
+Get-AzRA-LogicApps -AccessToken $token -ScanSecrets |
+    Where-Object { $_.HasSecrets } |
+    Select-Object LogicAppName, ResourceGroup, SecretFindings
+
+# Keywords personalizadas
+Get-AzRA-LogicApps -AccessToken $token -ScanSecrets `
+    -Keywords @('storageaccountkey', 'sqlconnection', 'apimsubscriptionkey')
+```
+
+**Parámetros:**
+
+| Parámetro | Tipo | Descripción |
+|---|---|---|
+| `-AccessToken` | `string` | Token Bearer de Azure Management API (**obligatorio**) |
+| `-SubscriptionId` | `string` | Limita el escaneo a una suscripción. Si se omite, escanea todas |
+| `-OutputPath` | `string` | Carpeta de salida para JSONs y CSVs (nombres auto-generados con timestamp) |
+| `-ScanSecrets` | `switch` | Activa el scanner de credenciales en 4 fuentes de la definición |
+| `-IncludeVersions` | `switch` | Recupera y analiza el historial de versiones de cada Logic App |
+| `-Keywords` | `string[]` | Keywords para la detección. Default: `password, secret, key, token, sas, bearer, authorization, ocp-apim...` |
+| `-MaxRetries` | `int` | Máximo de reintentos ante throttling/errores 5xx (1-10). Default: 3 |
+| `-RetryDelaySec` | `int` | Segundos base entre reintentos, multiplicado por el número de intento (1-60). Default: 5 |
+
+**Objeto devuelto por Logic App (pipeline):**
+
+| Campo | Descripción |
+|---|---|
+| `SubscriptionId` / `SubscriptionName` | Suscripción donde está la Logic App |
+| `ResourceGroup` | Resource group |
+| `LogicAppName` | Nombre de la Logic App |
+| `Location` | Región Azure |
+| `State` | Estado: `Enabled`, `Disabled`, `Suspended` |
+| `CreatedTime` / `ChangedTime` | Fechas de creación y última modificación |
+| `TriggerCount` | Número total de triggers definidos |
+| `TriggerTypes` | Tipos de trigger: `Request`, `Recurrence`, `ApiConnection`, etc. |
+| `HasExposedTrigger` | `$true` si hay algún trigger de tipo `Request` (acepta conexiones HTTP entrantes) |
+| `ExposedEndpoints` | IPs de `accessEndpointIpAddresses` si están configuradas |
+| `ActionCount` | Número total de acciones (incluyendo anidadas en Scope/If/Foreach) |
+| `HttpActionCount` | Número de acciones de tipo `Http` (llamadas salientes) |
+| `HasHttpActions` | `$true` si hay acciones HTTP |
+| `WorkflowParameterCount` | Total de parámetros del workflow |
+| `SecureStringParamCount` | Parámetros de tipo `SecureString` |
+| `PlaintextParamCount` | Parámetros con valor potencialmente visible |
+| `Tags` | Hashtable de tags del recurso |
+| `VersionCount` | Número de versiones en historial (`-1` si no se usó `-IncludeVersions`) |
+| `SecretFindings` | Array de findings. Vacío si `-ScanSecrets` no activo |
+| `HasSecrets` | `$true` si hay al menos un finding |
+| `RawFilePath` | Ruta al JSON guardado (`$null` si no se usó `-OutputPath`) |
+
+**Scanner de secrets (`-ScanSecrets`) — 4 fuentes:**
+
+| Fuente | Qué analiza | Tipo de finding |
+|---|---|---|
+| `WorkflowParam` | `properties.parameters` — parámetros del workflow | `SecureString` (reportado siempre), `PlainText` (por keyword en el nombre) |
+| `HttpAction` | Acciones de tipo `Http` — URI, headers, bloque `authentication`, body | `HttpUri`, `HttpHeader`, `HttpAuth`, `HttpBody` |
+| `Action` | Cualquier otro tipo de acción — `inputs` serializado | `ActionInput` |
+| `Trigger` | Triggers `ApiConnection` con inputs sospechosos | `TriggerInput` |
+| `Tag` | Key + value de los tags del recurso | `TagValue` |
+
+Los parámetros `SecureString` se reportan siempre aunque el valor esté enmascarado — su existencia ya es información relevante para el reconocimiento. Las expresiones dinámicas de Logic Apps (`@{body()}`, `@{outputs()}`) se filtran automáticamente para evitar falsos positivos.
+
+**Estructura de salida en disco (`-OutputPath`):**
+
+```
+<OutputPath>/
+  LogicAppsRawDump/
+    <Suscripcion>/
+      <ResourceGroup>/
+        <LogicApp>.json                 ← definición completa (properties.definition + parameters)
+        <LogicApp>_versions.json        ← solo si -IncludeVersions
+  AzRA-LogicApps_<timestamp>.csv
+  AzRA-LogicApps-Secrets_<timestamp>.csv   ← solo si -ScanSecrets
+```
+
+### Ejemplo de flujo de enumeración completo
+
+```powershell
+# 1. Importar módulo y obtener token
+Import-Module .\AzRA.psd1
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# 2. Escaneo completo
+$logicApps = Get-AzRA-LogicApps -AccessToken $token -OutputPath 'C:\Audit' -ScanSecrets -IncludeVersions
+Write-Output "Logic Apps encontradas: $($logicApps.Count)"
+
+# 3. Resumen de superficie de ataque
+Write-Output "`n--- Triggers expuestos (Request) ---"
+$logicApps | Where-Object { $_.HasExposedTrigger } |
+    Select-Object LogicAppName, ResourceGroup, ExposedEndpoints | Format-Table
+
+Write-Output "`n--- Logic Apps con acciones HTTP salientes ---"
+$logicApps | Where-Object { $_.HasHttpActions } |
+    Select-Object LogicAppName, ResourceGroup, HttpActionCount |
+    Sort-Object HttpActionCount -Descending | Format-Table
+
+# 4. Resumen de findings
+Write-Output "`n--- Findings de credenciales ---"
+$logicApps | Where-Object { $_.HasSecrets } |
+    Group-Object ResourceGroup |
+    Select-Object Name, Count | Sort-Object Count -Descending | Format-Table
+
+# 5. Ver findings en detalle
+$logicApps | Where-Object { $_.HasSecrets } | ForEach-Object {
+    Write-Output "`n[$($_.ResourceGroup)] $($_.LogicAppName)"
+    $_.SecretFindings | ForEach-Object {
+        Write-Output "  [$($_.Source)/$($_.FindingType)] $($_.PropertyPath) → $($_.MatchedValue)"
     }
 }
 ```

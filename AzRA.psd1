@@ -45,6 +45,8 @@ FunctionsToExport = @(
     'Get-AzRA-DeploymentParameterSecrets',
     # Internal reconnaissance - Automation
     'Get-AzRA-AutomationRunbooks',
+    # Internal reconnaissance - Logic Apps
+    'Get-AzRA-LogicApps',
     # External reconnaissance
     'Invoke-O365EmailValidator'
 )
