@@ -31,7 +31,7 @@ PowerShellVersion = '5.1'
 
 # Functions to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no functions to export.
 FunctionsToExport = @(
-    # Internal reconnaissance
+    # Internal reconnaissance - Microsoft Graph / Azure Management API
     'Get-AzRA-Subscriptions',
     'Get-AzRA-ResourcesBySubscriptionID',
     'Get-AzRA-RoleAssignment',
@@ -41,6 +41,8 @@ FunctionsToExport = @(
     'Get-AzRA-RolesGroupsByEmail',
     'Invoke-AzRA-APIRequest',
     'Request-AzRA-Nonce',
+    # Internal reconnaissance - Az module
+    'Get-AzRA-DeploymentParameterSecrets',
     # External reconnaissance
     'Invoke-O365EmailValidator'
 )

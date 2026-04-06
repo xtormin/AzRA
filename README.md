@@ -16,7 +16,7 @@ Kit de herramientas PowerShell para reconocimiento y pruebas de seguridad en Azu
 3. [📚 Reconocimiento Interno (Azure/M365)](#-reconocimiento-interno-azurem365)
    - [Funciones Disponibles](#funciones-disponibles)
    - [Ejemplos por Función](#ejemplos-por-función)
-   - [Ejemplo de Flujo de Enumeración](#ejemplo-de-flujo-de-enumeración)
+   - [Ejemplo de Flujo de Enumeración](#ejemplo-de-flujo-de-enumeración-completo)
 4. [🌐 Reconocimiento Externo (O365)](#-reconocimiento-externo-o365)
    - [Funciones Disponibles](#funciones-disponibles-1)
    - [Ejemplos de Uso](#ejemplos-de-uso)
@@ -106,6 +106,9 @@ $graphToken = (az account get-access-token --resource https://graph.microsoft.co
 - `Get-AzRA-AppRoleAssignment` - Obtener asignaciones de roles de una aplicación
 - `Get-AzRA-RolesGroupsByEmail` - Obtener membresías de grupos y roles de usuario (con paginación)
 - `Invoke-AzRA-APIRequest` - Hacer peticiones personalizadas a cualquier endpoint de Azure o Microsoft Graph
+
+#### Módulo Az (requiere Connect-AzAccount)
+- `Get-AzRA-DeploymentParameterSecrets` - Auditar el historial de deployments buscando credenciales en texto claro
 
 ### Ejemplos por Función
 
@@ -287,6 +290,101 @@ $privilegedUsers | Select-Object userPrincipalName, displayName | Format-Table
 # 7. Enumerar aplicaciones
 $apps = Get-AzRA-EnterpriseApplications -AccessToken $graphToken
 Write-Output "`nAplicaciones encontradas: $($apps.Count)"
+```
+
+#### 10. Get-AzRA-DeploymentParameterSecrets
+
+Audita el historial de deployments de Azure buscando parámetros ARM que contengan credenciales o secretos en texto claro.
+
+**Cómo funciona:**
+
+1. Verifica que existe una sesión Az activa (`Connect-AzAccount`)
+2. Itera sobre todas las suscripciones accesibles (o una específica)
+3. Por cada suscripción → resource groups → deployments
+4. Inspecciona `$dep.Parameters.Keys` buscando coincidencias con keywords (`password`, `secret`, `key`, `token`, etc.)
+5. Filtra parámetros de tipo `SecureString` y valores falsos positivos (`null`, `true`, `false`, `none`...)
+6. Devuelve los hallazgos al pipeline como objetos y opcionalmente los exporta a CSV
+
+**Retry automático:** ante errores HTTP 429 (throttling) o errores transitorios 5xx, reintenta automáticamente con backoff lineal (espera `RetryDelaySec × intento`).
+
+**Permisos requeridos:**
+- `Microsoft.Resources/deployments/read`
+- `Microsoft.Resources/subscriptions/resourceGroups/read`
+
+```powershell
+# Escanear todas las suscripciones
+Connect-AzAccount
+Get-AzRA-DeploymentParameterSecrets
+
+# Escanear solo una suscripción
+Get-AzRA-DeploymentParameterSecrets -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+
+# Exportar hallazgos a CSV (nombre auto-generado con timestamp)
+Get-AzRA-DeploymentParameterSecrets -OutputPath 'C:\Reports'
+# → C:\Reports\AzRA-DeploymentSecrets_20250406-1530.csv
+
+# Exportar CSV y volcar todos los deployments en JSON para revisión manual
+Get-AzRA-DeploymentParameterSecrets -OutputPath 'C:\Reports' -DumpRaw
+# → C:\Reports\AzRA-DeploymentSecrets_20250406-1530.csv
+# → C:\Reports\DeploymentTemplatesRawDump\<Suscripcion>\<ResourceGroup>\<Deployment>.json
+
+# Filtrar por resource group
+Get-AzRA-DeploymentParameterSecrets | Where-Object { $_.'Grupo de recursos' -eq 'Production' }
+
+# Keywords personalizadas
+Get-AzRA-DeploymentParameterSecrets -Keywords @('connectionstring', 'storageaccountkey', 'sas')
+
+# Ajustar reintentos ante throttling
+Get-AzRA-DeploymentParameterSecrets -MaxRetries 5 -RetryDelaySec 10
+```
+
+**Parámetros:**
+
+| Parámetro | Tipo | Descripción |
+|---|---|---|
+| `-SubscriptionId` | `string` | Limita el escaneo a una suscripción concreta. Si se omite, escanea todas |
+| `-Keywords` | `string[]` | Lista de keywords para buscar en nombres de parámetros. Default: `password, secret, admin, key, pwd, cred, token, auth` |
+| `-OutputPath` | `string` | Carpeta de salida. El CSV se genera con timestamp automático |
+| `-DumpRaw` | `switch` | Vuelca los objetos raw de cada deployment como JSON. Requiere `-OutputPath` |
+| `-MaxRetries` | `int` | Máximo de reintentos ante throttling/errores 5xx (1-10). Default: 3 |
+| `-RetryDelaySec` | `int` | Segundos base entre reintentos, multiplicado por el número de intento (1-60). Default: 5 |
+
+**Campos de cada hallazgo (CSV y pipeline):**
+
+| Campo | Descripción |
+|---|---|
+| `Nombre suscripcion` | Nombre de la suscripción |
+| `ID suscripcion` | GUID de la suscripción |
+| `Grupo de recursos` | Resource group donde está el deployment |
+| `Deployment Name` | Nombre del deployment |
+| `Parametros` | JSON con `Name`, `Value` y `Type` del parámetro encontrado |
+
+**Estructura del dump raw (`-DumpRaw`):**
+
+```
+<OutputPath>/
+  DeploymentTemplatesRawDump/
+    <Suscripcion>/
+      <ResourceGroup>/
+        <DeploymentName>.json    ← objeto completo de Get-AzResourceGroupDeployment
+```
+
+### Ejemplo de flujo de enumeración completo
+
+```powershell
+# 1. Importar módulo y autenticar
+Import-Module .\AzRA.psd1
+Connect-AzAccount
+
+# 2. Buscar credenciales en historial de deployments
+$secrets = Get-AzRA-DeploymentParameterSecrets -OutputPath 'C:\Reports\secrets.csv'
+Write-Output "Hallazgos encontrados: $($secrets.Count)"
+
+# 3. Ver hallazgos agrupados por suscripción
+$secrets | Group-Object 'Nombre suscripcion' | Select-Object Count, Name | Sort-Object Count -Descending
+
+# 4. Extraer solo los valores (para revisión manual)
+$secrets | ForEach-Object { $_.Parametros | ConvertFrom-Json } | Select-Object Name, Value, Type
 ```
 
 ## 🌐 Reconocimiento Externo (O365)
