@@ -49,6 +49,8 @@ FunctionsToExport = @(
     'Get-AzRA-LogicApps',
     # Internal reconnaissance - Storage
     'Get-AzRA-StorageAccounts',
+    # Internal reconnaissance - Container Registry
+    'Get-AzRA-ContainerRegistries',
     # Internal reconnaissance - Key Vault
     'Get-AzRA-KeyVaults',
     # Internal reconnaissance - Virtual Machines

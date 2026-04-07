@@ -128,6 +128,9 @@ $graphToken = (az account get-access-token --resource https://graph.microsoft.co
 #### Microsoft Graph API — Entra ID
 - `Get-AzRA-EntraID` - Auditar la configuración de seguridad del tenant de Entra ID: roles privilegiados, MFA, aplicaciones registradas, Conditional Access y políticas de directorio
 
+#### API de Azure Management — Container Registry
+- `Get-AzRA-ContainerRegistries` - Enumerar Azure Container Registries, auditar misconfiguraciones de seguridad, obtener tokens ACR de data plane, enumerar repositorios/tags/tamaños e interactuar con imágenes para docker pull
+
 ### Ejemplos por Función
 
 #### 1. Request-AzRA-Nonce
@@ -771,7 +774,7 @@ Get-AzRA-StorageAccounts -AccessToken $token |
 | **Alto** | `NoSasExpirationPolicy` | `sasPolicy` es null — los SAS tokens no tienen expiración forzada |
 | **Alto** | `BlobPublicAccessAllowedAtAccount` | `allowBlobPublicAccess = true` — la cuenta permite contenedores públicos |
 | **Info** | `FirewallBypassAzureServices` | El firewall permite bypass a servicios Azure |
-| **Info** | `NoCustomerManagedKeys` | Cifrado con claves de Microsoft, no del cliente |
+| **Info** | `NoCustomerManagedKeys` | Cifrado con claves de Microsoft, no del cliente (`encryption.keySource`) |
 
 **Objeto devuelto por cuenta (pipeline):**
 
@@ -1483,6 +1486,148 @@ if ($r.AppsWithoutOwners) {
     Write-Output "[-] Apps sin propietario: $($r.AppsWithoutOwners.Count)"
 }
 ```
+
+#### 18. Get-AzRA-ContainerRegistries
+
+Enumera todos los Azure Container Registries (ACR) accesibles, evalúa misconfiguraciones de seguridad a nivel ARM, y opcionalmente realiza reconocimiento del data plane (repositorios, tags, tamaños de imagen) con selección interactiva para docker pull.
+
+**Cómo funciona:**
+
+La función opera en dos capas diferenciadas:
+
+**Capa ARM** (token `management.azure.com`, siempre activa):
+- Lista todos los registries en las subscripciones accesibles via `Microsoft.ContainerRegistry/registries`
+- Evalúa checks críticos, altos e informativos sobre la configuración del registry
+- Intenta obtener credenciales de admin si `adminUserEnabled` está activo
+- Recupera la configuración de Diagnostic Settings para verificar si se registran logs
+
+**Capa data plane** (`-ScanRepositories`):
+- Intercambia el ARM token por un ACR refresh token via `POST https://{registry}.azurecr.io/oauth2/exchange` — equivalente a `az acr login --expose-token`
+- Obtiene access tokens con scope específico (`registry:catalog:*`, `repository:{repo}:pull`)
+- Enumera repositorios (`/v2/_catalog`, paginado via header `Link`)
+- Para cada repositorio lista tags y calcula el **tamaño comprimido** de cada imagen sumando `config.size + layers[].size` del manifest v2
+- Genera automáticamente un archivo `.txt` con todos los comandos `docker pull`
+
+**Selección interactiva** (`-InteractivePull`):
+- Muestra tabla con índice, imagen completa y tamaño antes de ejecutar ningún pull
+- El usuario selecciona por índice (ej: `1,3`), `all` o `none`
+- Si el total supera 5 GB, pide confirmación adicional
+- Si Docker no está disponible, genera igualmente el archivo de comandos
+
+**Checks de seguridad (ARM):**
+
+| Severidad | Check | Descripción |
+|---|---|---|
+| Crítico | `AnonymousPullEnabled` | Cualquier usuario puede hacer pull sin autenticación |
+| Crítico | `AdminUserEnabled` | Usuario admin habilitado (credenciales estáticas) |
+| Crítico | `PublicNetworkAccessEnabled` | Acceso público sin restricciones de red |
+| Alto | `NoFirewallRules` | Sin reglas de firewall IP configuradas |
+| Alto | `RetentionPolicyDisabled` | Sin política de retención de imágenes no etiquetadas |
+| Alto | `ContentTrustDisabled` | Content Trust (firma de imágenes) no habilitado |
+| Alto | `DiagnosticLogsDisabled` | Sin Diagnostic Settings configurados |
+| Alto | `BasicSku` | SKU Basic no soporta content trust, private endpoints ni geo-replicación |
+| Info | `NoPrivateEndpoints` | Sin Private Endpoints configurados |
+| Info | `ZoneRedundancyDisabled` | Sin redundancia de zona habilitada |
+
+**Permisos necesarios:**
+- `Microsoft.ContainerRegistry/registries/read` — base
+- `Microsoft.ContainerRegistry/registries/listCredentials/action` — solo si admin user habilitado
+- `microsoft.insights/diagnosticSettings/read` — opcional, para check de logs
+
+**Uso básico:**
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Solo checks de seguridad ARM
+Get-AzRA-ContainerRegistries -AccessToken $token
+
+# Una sola subscripción
+Get-AzRA-ContainerRegistries -AccessToken $token -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+```
+
+**Enumeración de repositorios y generación de pull commands:**
+```powershell
+# Enumera repos/tags/tamaños y genera AzRA-ACR-PullCommands_<timestamp>.txt
+Get-AzRA-ContainerRegistries -AccessToken $token -ScanRepositories -OutputPath 'C:\Audit'
+```
+
+**Selección interactiva de imágenes:**
+```powershell
+# Muestra tabla, pregunta qué hacer pull, ejecuta docker pull para los seleccionados
+Get-AzRA-ContainerRegistries -AccessToken $token -ScanRepositories -InteractivePull
+```
+
+Ejemplo de salida interactiva:
+```
+[*] Seleccion interactiva de imagenes para docker pull
+
+  Registry: miacr.azurecr.io  (3 imagenes, 2.4 GB total)
+
+  Idx  Imagen                                                       Tamano
+  ---  ------                                                       ------
+  [1]  hasura/graphql-engine:v2.38.1                                1.2 GB
+  [2]  myapp/backend:latest                                         800 MB
+  [3]  myapp/frontend:v1.0                                          400 MB
+
+Introduce los indices a descargar (ej: 1,3), 'all' para todos, 'none' para omitir:
+  > 1,2
+
+  [~] Ejecutando: docker pull miacr.azurecr.io/hasura/graphql-engine:v2.38.1
+  [~] Ejecutando: docker pull miacr.azurecr.io/myapp/backend:latest
+```
+
+**Filtrado de resultados:**
+```powershell
+$result = Get-AzRA-ContainerRegistries -AccessToken $token -ScanRepositories
+
+# Registries con admin user habilitado o pull anónimo
+$result | Where-Object { $_.AdminUserEnabled -or $_.AnonymousPullEnabled }
+
+# Registries donde se obtuvo acceso al data plane
+$result | Where-Object { $_.DataPlaneAccessible -eq $true } |
+    Select-Object RegistryName, RepositoryCount, TotalImageSizeGB
+
+# Ver detalle de repos de un registry
+$result | Where-Object { $_.RegistryName -eq 'miacr' } |
+    ForEach-Object {
+        $_.Repositories | Format-Table RepositoryName, TagCount,
+            @{N='SizeMB'; E={[Math]::Round($_.TotalSizeBytes/1MB, 1)}}
+    }
+
+# Solo registries con findings críticos
+$result | Where-Object { $_.HasCriticalFindings } |
+    Select-Object LoginServer, AnonymousPullEnabled, AdminUserEnabled, PublicNetworkAccessEnabled
+```
+
+**Flujo de reconocimiento (replica el proceso manual):**
+```powershell
+# Equivalente a:
+#   az acr list
+#   az acr login --expose-token --name $server
+#   docker login $server -u 00000000-0000-0000-0000-000000000000 -p $token
+#   az acr repository list --name $server
+#   az acr repository show-tags --name $server --repository "hasura/graphql-engine"
+#   docker pull $server/hasura/graphql-engine:v2.38.1
+
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+$result = Get-AzRA-ContainerRegistries -AccessToken $token -ScanRepositories -InteractivePull -OutputPath 'C:\Audit'
+```
+
+**Archivos generados (`-OutputPath`):**
+```
+C:\Audit\
+  AzRA-ContainerRegistries_<timestamp>.csv           # 1 fila por registry, todos los checks booleanos
+  AzRA-ContainerRegistries-Repos_<timestamp>.csv     # 1 fila por imagen (registry, repo, tag, tamano)
+  AzRA-ACR-PullCommands_<timestamp>.txt              # Comandos docker pull para todas las imagenes
+  ContainerRegistriesRawDump\
+    <SubscriptionName>\
+      <RegistryName>\
+        registry.json         # Objeto ARM completo del registry
+        diagnostics.json      # Estado de Diagnostic Settings
+        repositories.json     # Repos, tags y tamanios (si -ScanRepositories)
+```
+
+---
 
 ## 🌐 Reconocimiento Externo (O365)
 
