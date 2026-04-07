@@ -768,7 +768,7 @@ Get-AzRA-StorageAccounts -AccessToken $token |
 | **Crítico** | `HasBlobPublicContainers` | Algún contenedor con `publicAccess = "Blob"` (lectura si se conoce la URL) |
 | **Crítico** | `NoFirewall` | `networkAcls.defaultAction = "Allow"` — cualquier IP puede acceder |
 | **Crítico** | `SharedKeyAccessEnabled` | `allowSharedKeyAccess` no es `false` explícito (null = habilitado en cuentas antiguas) |
-| **Alto** | `HttpsNotEnforced` | `supportsHttpsTrafficOnly = false` — permite tráfico HTTP sin cifrar |
+| **Alto** | `HttpsNotEnforced` | `supportsHttpsTrafficOnly = false` — permite tráfico HTTP sin cifrar. **Nota:** este campo es un flag de hallazgo (`true` = hay problema), no una copia directa de la propiedad Azure. Ver `HttpsTrafficOnlyEnabled` para el valor raw. |
 | **Alto** | `WeakTlsVersion` | `minimumTlsVersion` es `TLS1_0` o `TLS1_1` |
 | **Alto** | `NoKeyExpirationPolicy` | `keyPolicy` es null — las claves no tienen rotación obligatoria |
 | **Alto** | `NoSasExpirationPolicy` | `sasPolicy` es null — los SAS tokens no tienen expiración forzada |
@@ -787,6 +787,7 @@ Get-AzRA-StorageAccounts -AccessToken $token |
 | `CreationTime` | Fecha de creación |
 | `HasPublicContainers` / `HasBlobPublicContainers` | Flags de contenedores públicos |
 | `NoFirewall`, `SharedKeyAccessEnabled`, ... | Todos los checks de seguridad (bool) |
+| `HttpsTrafficOnlyEnabled` | Espejo directo de `supportsHttpsTrafficOnly` de la API Azure. `$true` = HTTPS forzado (sin hallazgo). Usar este campo para comparar con el valor visto en el portal. |
 | `MinimumTlsVersion`, `NetworkDefaultAction`, `EncryptionKeySource` | Valores raw de configuración |
 | `ContainerCount` / `PublicContainerCount` / `BlobPublicContainerCount` | Conteos de contenedores |
 | `PublicContainerNames` | Nombres de contenedores Container-level (comma-separated) |
@@ -844,8 +845,10 @@ $storage | Where-Object { $_.NoFirewall } |
     Select-Object StorageAccountName, ResourceGroup, SubscriptionName | Format-Table
 
 Write-Output "`n--- TLS débil o HTTPS no forzado (ALTO) ---"
+# HttpsNotEnforced = true significa hallazgo (HTTPS NO forzado)
+# HttpsTrafficOnlyEnabled = valor raw de la API (true = HTTPS forzado, sin problema)
 $storage | Where-Object { $_.WeakTlsVersion -or $_.HttpsNotEnforced } |
-    Select-Object StorageAccountName, MinimumTlsVersion, HttpsNotEnforced | Format-Table
+    Select-Object StorageAccountName, MinimumTlsVersion, HttpsNotEnforced, HttpsTrafficOnlyEnabled | Format-Table
 
 # 4. Ver claves extraídas
 $storage | Where-Object { $_.HasKeyFindings } | ForEach-Object {

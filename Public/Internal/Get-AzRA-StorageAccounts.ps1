@@ -389,7 +389,8 @@ function Get-AzRA-StorageAccounts {
                 FirewallBypassAzureServices      = $firewallBypassAzSvc
                 NoCustomerManagedKeys            = $noCustomerManagedKeys
 
-                # Raw config values
+                # Raw config values (direct mirror of Azure API properties)
+                HttpsTrafficOnlyEnabled          = $props.supportsHttpsTrafficOnly
                 MinimumTlsVersion                = $props.minimumTlsVersion
                 NetworkDefaultAction             = $props.networkAcls.defaultAction
                 NetworkBypass                    = $bypassStr
@@ -428,7 +429,7 @@ function Get-AzRA-StorageAccounts {
                 HttpsNotEnforced, WeakTlsVersion, NoKeyExpirationPolicy, NoSasExpirationPolicy,
                 BlobPublicAccessAllowedAtAccount,
                 FirewallBypassAzureServices, NoCustomerManagedKeys,
-                MinimumTlsVersion, NetworkDefaultAction, NetworkBypass, EncryptionKeySource,
+                HttpsTrafficOnlyEnabled, MinimumTlsVersion, NetworkDefaultAction, NetworkBypass, EncryptionKeySource,
                 ContainerCount, PublicContainerCount, BlobPublicContainerCount, PublicContainerNames,
                 AnonymousBlobCount, AnonymousBlobs,
                 HasKeyFindings, RawFilePath |
