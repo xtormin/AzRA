@@ -125,6 +125,9 @@ $graphToken = (az account get-access-token --resource https://graph.microsoft.co
 #### API de Azure Management — Virtual Machines
 - `Get-AzRA-VirtualMachines` - Enumerar Virtual Machines y SQL VMs auditando exposición de red, extensiones peligrosas, cifrado de disco y configuración de seguridad
 
+#### Microsoft Graph API — Entra ID
+- `Get-AzRA-EntraID` - Auditar la configuración de seguridad del tenant de Entra ID: roles privilegiados, MFA, aplicaciones registradas, Conditional Access y políticas de directorio
+
 ### Ejemplos por Función
 
 #### 1. Request-AzRA-Nonce
@@ -1247,6 +1250,238 @@ $vms |
             Where-Object { $_ -eq $true } | Measure-Object | Select-Object -Expand Count
         }} |
     Sort-Object CriticalCount -Descending | Format-Table
+```
+
+#### 17. Get-AzRA-EntraID
+
+Audita la configuración de seguridad del tenant de Entra ID (Azure Active Directory) desde perspectiva de pentester. A diferencia del resto de funciones, devuelve un **único objeto por tenant** con colecciones de findings organizadas por severidad. Cubre usuarios privilegiados, configuración de MFA, aplicaciones registradas, políticas de Conditional Access y ajustes globales de directorio.
+
+**Cómo funciona:**
+
+1. Realiza las llamadas base con `Directory.Read.All`:
+   - Información del tenant (nombre, dominios, licencias P1/P2)
+   - Authorization Policy (quién puede registrar apps, invitar guests, dar consentimiento)
+   - Security Defaults
+   - Role definitions y role assignments (con expansión del principal en la misma llamada)
+   - Lista completa de usuarios + `signInActivity` para detectar cuentas inactivas
+   - Service Principals para identificar apps con roles privilegiados
+2. Si `-IncludeMFAReport`: lee `/reports/authenticationMethods/userRegistrationDetails` para evaluar el estado de MFA de cada usuario
+3. Si `-IncludeApps`: enumera todas las App Registrations y evalúa credenciales expiradas, apps sin propietario, apps multi-tenant y permisos Graph sensibles
+4. Si `-IncludeConditionalAccess`: lee todas las CA policies y evalúa si la auth legacy está bloqueada, si se exige MFA a admins y usuarios, y si hay políticas en modo report-only
+5. Cruza los datos entre colecciones (ej: Global Admins → MFA index) para findings combinados
+6. Exporta CSVs y dump JSON raw si se especifica `-OutputPath`
+
+**Token necesario:** Graph API — scope `https://graph.microsoft.com/`
+
+**Permisos por módulo:**
+
+| Switch | Permiso requerido | Qué analiza |
+|---|---|---|
+| (base, siempre) | `Directory.Read.All` | Tenant, roles, usuarios, SPs, authorization policy |
+| `-IncludeMFAReport` | `Reports.Read.All` + `AuditLog.Read.All` | Estado MFA por usuario, admins sin MFA |
+| `-IncludeApps` | `Application.Read.All` | App registrations: credenciales, propietarios, permisos |
+| `-IncludeConditionalAccess` | `Policy.Read.All` | CA policies: legacy auth, MFA gaps, report-only |
+
+Si alguna llamada devuelve 403, se emite `Write-Warning` con el permiso que falta y el análisis continúa con los datos disponibles.
+
+```powershell
+$graphToken = (az account get-access-token --resource https://graph.microsoft.com | ConvertFrom-Json).accessToken
+
+# Análisis base (solo Directory.Read.All)
+Get-AzRA-EntraID -GraphToken $graphToken
+
+# Análisis completo con todos los módulos
+Get-AzRA-EntraID -GraphToken $graphToken -IncludeMFAReport -IncludeApps -IncludeConditionalAccess
+
+# Con exportación a disco (CSVs + JSON raw dump)
+Get-AzRA-EntraID -GraphToken $graphToken -IncludeMFAReport -IncludeApps -IncludeConditionalAccess -OutputPath 'C:\Audit'
+
+# Solo una suscripción / tenant (el token ya define el scope del tenant)
+
+# Ver Global Admins sin MFA (CRÍTICO)
+$r = Get-AzRA-EntraID -GraphToken $graphToken -IncludeMFAReport
+$r.GlobalAdminsWithoutMFA | Select-Object DisplayName, UserPrincipalName, MethodsRegistered
+
+# Ver usuarios Guest con roles privilegiados (CRÍTICO)
+$r.PrivilegedGuests | Select-Object DisplayName, UserPrincipalName, Roles
+
+# Ver cuentas privilegiadas inactivas >90 días (ALTO)
+$r.StalePrivilegedAccounts | Select-Object DisplayName, UserPrincipalName, LastSignIn, Roles
+
+# Ver si legacy auth está bloqueada (CRÍTICO)
+$r.LegacyAuthNotBlocked    # $true = RIESGO (no está bloqueada)
+
+# Ver resumen de misconfiguraciones críticas y altas
+$r | Select-Object TenantDisplayName, HasCriticalFindings, HasHighFindings,
+    SecurityDefaultsDisabled, UsersCanRegisterApps, GuestInvitationNotRestricted,
+    LegacyAuthNotBlocked, NoMFARequiredForAdmins, MFARegistrationRate
+
+# Ver apps con permisos Graph sensibles (CRÍTICO)
+$r.AppsWithBroadPermissions | Select-Object DisplayName, AppId, SensitivePermissions
+
+# Ver CA policies en modo report-only (no aplicadas)
+$r.CAPoliciesReportOnly | Select-Object DisplayName, State
+```
+
+**Parámetros:**
+
+| Parámetro | Tipo | Descripción |
+|---|---|---|
+| `-GraphToken` | `string` | Token Bearer de Microsoft Graph API (**obligatorio**) |
+| `-OutputPath` | `string` | Carpeta de salida para JSONs y CSVs (nombres auto-generados con timestamp) |
+| `-IncludeMFAReport` | `switch` | Activa el análisis de estado MFA por usuario (requiere `Reports.Read.All`) |
+| `-IncludeApps` | `switch` | Activa el análisis de App Registrations (requiere `Application.Read.All`) |
+| `-IncludeConditionalAccess` | `switch` | Activa el análisis de CA policies (requiere `Policy.Read.All`) |
+| `-MaxRetries` | `int` | Máximo de reintentos ante throttling/errores 5xx (1-10). Default: 3 |
+| `-RetryDelaySec` | `int` | Segundos base entre reintentos, multiplicado por el número de intento (1-60). Default: 5 |
+
+**Checks de seguridad evaluados:**
+
+| Severidad | Campo | Condición de riesgo |
+|---|---|---|
+| **Crítico** | `GlobalAdminsWithoutMFA` | Global Administrators sin ningún método MFA registrado |
+| **Crítico** | `PrivilegedGuests` | Usuarios de tipo Guest con roles privilegiados asignados |
+| **Crítico** | `PrivilegedServicePrincipals` | Service Principals con roles privilegiados (Global Admin, Security Admin, etc.) |
+| **Crítico** | `LegacyAuthNotBlocked` | Sin CA policy activa que bloquee `exchangeActiveSync` / `other` (auth legacy) |
+| **Crítico** | `NoMFARequiredForAdmins` | Sin CA policy activa que exija MFA a roles privilegiados |
+| **Crítico** | `AppsWithBroadPermissions` | Apps con permisos sensibles admin-consented: `Directory.ReadWrite.All`, `Mail.ReadWrite`, `Application.ReadWrite.All`, etc. |
+| **Alto** | `SecurityDefaultsDisabled` | Security Defaults desactivadas — sin baseline de MFA/legacy auth |
+| **Alto** | `UsersCanRegisterApps` | `allowedToCreateApps = true` — cualquier usuario puede registrar aplicaciones |
+| **Alto** | `UsersCanConsentToApps` | Política de consent no restringida — usuarios pueden autorizar apps a acceder a sus datos |
+| **Alto** | `GuestInvitationNotRestricted` | `allowInvitesFrom` permite invitación por usuarios no-admin |
+| **Alto** | `AdminConsentWorkflowDisabled` | Sin flujo de aprobación para consent de apps — facilita illicit consent grant attacks |
+| **Alto** | `StalePrivilegedAccounts` | Cuentas con rol privilegiado sin actividad en >90 días |
+| **Alto** | `UsersWithoutMFA` | Usuarios sin ningún método MFA registrado |
+| **Alto** | `UsersWithWeakMFA` | Usuarios con MFA solo por SMS/voz (vulnerable a SIM swapping) |
+| **Alto** | `AppsWithExpiredCredentials` | Apps con `passwordCredentials` o `keyCredentials` expirados |
+| **Alto** | `AppsWithoutOwners` | Apps registradas sin propietario asignado |
+| **Alto** | `MultiTenantApps` | Apps con `signInAudience` externo al tenant — accesibles desde otros tenants |
+| **Alto** | `CAPoliciesReportOnly` | CA policies en modo `reportOnly` — reportan pero no aplican restricciones |
+| **Alto** | `NoCARequiringMFAForAllUsers` | Sin CA policy que exija MFA para todos los usuarios |
+
+**Objeto devuelto por tenant:**
+
+| Campo | Descripción |
+|---|---|
+| `TenantId`, `TenantDisplayName`, `TenantCreatedDateTime` | Identidad del tenant |
+| `VerifiedDomains` | Array de dominios verificados |
+| `TenantHasP1P2` | `$true` si el tenant tiene licencia Azure AD Premium P1 o P2 |
+| `HasCriticalFindings` / `HasHighFindings` | Flags de resumen para filtrado rápido |
+| `TotalUserCount`, `GuestCount`, `GlobalAdminCount` | Estadísticas del tenant |
+| `MFARegistrationRate` | % de usuarios con MFA registrado (solo con `-IncludeMFAReport`) |
+| `ExternalAppsCount` | Número de apps multi-tenant (solo con `-IncludeApps`) |
+| `ActiveCAPoliciesCount` | CA policies en estado `enabled` (solo con `-IncludeConditionalAccess`) |
+| `GlobalAdminsWithoutMFA` | Array de `{Id, DisplayName, UPN, MethodsRegistered}` |
+| `PrivilegedGuests` | Array de `{Id, DisplayName, UPN, Roles}` |
+| `PrivilegedServicePrincipals` | Array de `{Id, DisplayName, AppId, Roles}` |
+| `StalePrivilegedAccounts` | Array de `{Id, DisplayName, UPN, LastSignIn, Roles}` |
+| `UsersWithoutMFA` / `UsersWithWeakMFA` | Arrays de usuarios |
+| `AppsWithBroadPermissions` | Array de `{DisplayName, AppId, SignInAudience, SensitivePermissions}` |
+| `AppsWithExpiredCredentials` | Array de `{DisplayName, AppId, CredentialType, ExpiredOn}` |
+| `GlobalAdmins` | Lista completa de Global Administrators |
+| `AllPrivilegedRoleAssignments` | Todos los role assignments a roles de alta privilegio |
+| `CAPoliciesReportOnly` | Políticas activas pero no aplicadas |
+
+**Estructura de salida en disco (`-OutputPath`):**
+
+```
+<OutputPath>/
+  EntraIDRawDump/
+    tenant.json                          ← /organization object
+    authorizationPolicy.json             ← authorization policy
+    securityDefaults.json                ← security defaults enforcement policy
+    roleAssignments.json                 ← todos los role assignments con principal
+    conditionalAccessPolicies.json       ← CA policies (si -IncludeConditionalAccess)
+    applications.json                    ← app registrations (si -IncludeApps)
+    mfaRegistrationDetails.json          ← MFA report (si -IncludeMFAReport)
+  AzRA-EntraID-Summary_<timestamp>.csv              ← 1 fila con todos los flags y conteos
+  AzRA-EntraID-GlobalAdmins_<timestamp>.csv         ← lista de Global Admins
+  AzRA-EntraID-PrivilegedUsers_<timestamp>.csv      ← todos los role assignments privilegiados
+  AzRA-EntraID-MFA_<timestamp>.csv                  ← estado MFA de todos los usuarios
+  AzRA-EntraID-Apps_<timestamp>.csv                 ← apps con checks de seguridad
+  AzRA-EntraID-CAPolicies_<timestamp>.csv           ← CA policies con evaluación
+```
+
+**Permisos sensibles de Graph monitorizados (`-IncludeApps`):**
+
+| Permiso | Por qué es crítico |
+|---|---|
+| `Directory.ReadWrite.All` | Modificar cualquier objeto del directorio |
+| `Directory.Read.All` | Leer todo el directorio (usuarios, grupos, apps, roles) |
+| `User.ReadWrite.All` | Modificar cualquier usuario del tenant |
+| `Mail.ReadWrite` / `Mail.Read` | Leer y escribir todos los buzones de correo |
+| `Group.ReadWrite.All` | Gestionar todos los grupos (incluyendo roles) |
+| `Application.ReadWrite.All` | Crear y modificar aplicaciones — permite backdoors |
+| `AppRoleAssignment.ReadWrite.All` | Asignar roles de aplicación — escalada de privilegios |
+| `RoleManagement.ReadWrite.Directory` | Gestionar roles de directorio — acceso total |
+
+### Ejemplo de flujo de enumeración completo
+
+```powershell
+# 1. Importar módulo y obtener token
+Import-Module .\AzRA.psd1
+$graphToken = (az account get-access-token --resource https://graph.microsoft.com | ConvertFrom-Json).accessToken
+
+# 2. Análisis completo
+$r = Get-AzRA-EntraID -GraphToken $graphToken `
+    -IncludeMFAReport -IncludeApps -IncludeConditionalAccess `
+    -OutputPath 'C:\Audit' -Verbose
+
+# 3. Resumen ejecutivo
+Write-Output "Tenant: $($r.TenantDisplayName) ($($r.TenantId))"
+Write-Output "Licencia P1/P2: $($r.TenantHasP1P2)"
+Write-Output "Usuarios totales: $($r.TotalUserCount) | Guests: $($r.GuestCount)"
+Write-Output "Global Admins: $($r.GlobalAdminCount)"
+Write-Output "MFA registration rate: $($r.MFARegistrationRate)%"
+
+# 4. Findings críticos
+Write-Output "`n=== CRÍTICOS ==="
+
+if ($r.GlobalAdminsWithoutMFA) {
+    Write-Output "[!] Global Admins sin MFA:"
+    $r.GlobalAdminsWithoutMFA | ForEach-Object { Write-Output "    $($_.UserPrincipalName)" }
+}
+
+if ($r.PrivilegedGuests) {
+    Write-Output "[!] Guest users con roles privilegiados:"
+    $r.PrivilegedGuests | ForEach-Object { Write-Output "    $($_.UserPrincipalName) → $($_.Roles)" }
+}
+
+if ($r.LegacyAuthNotBlocked) { Write-Output "[!] Legacy authentication NO está bloqueada" }
+if ($r.NoMFARequiredForAdmins) { Write-Output "[!] No hay CA policy que exija MFA a admins" }
+
+if ($r.AppsWithBroadPermissions) {
+    Write-Output "[!] Apps con permisos Graph sensibles:"
+    $r.AppsWithBroadPermissions | ForEach-Object {
+        Write-Output "    $($_.DisplayName) → $($_.SensitivePermissions)"
+    }
+}
+
+# 5. Findings altos
+Write-Output "`n=== ALTOS ==="
+if ($r.SecurityDefaultsDisabled) { Write-Output "[-] Security Defaults desactivadas" }
+if ($r.UsersCanRegisterApps) { Write-Output "[-] Los usuarios pueden registrar aplicaciones" }
+if ($r.GuestInvitationNotRestricted) { Write-Output "[-] Invitación de guests no restringida a admins" }
+
+if ($r.StalePrivilegedAccounts) {
+    Write-Output "[-] Cuentas privilegiadas sin actividad >90 días:"
+    $r.StalePrivilegedAccounts | ForEach-Object {
+        Write-Output "    $($_.UserPrincipalName) — último acceso: $($_.LastSignIn ?? 'nunca')"
+    }
+}
+
+Write-Output "[-] Usuarios sin MFA: $($r.UsersWithoutMFA.Count)"
+Write-Output "[-] Usuarios con MFA débil (SMS/voz): $($r.UsersWithWeakMFA.Count)"
+
+# 6. Apps problemáticas
+if ($r.AppsWithExpiredCredentials) {
+    Write-Output "`n[-] Apps con credenciales expiradas:"
+    $r.AppsWithExpiredCredentials | Select-Object DisplayName, CredentialType, ExpiredOn | Format-Table
+}
+
+if ($r.AppsWithoutOwners) {
+    Write-Output "[-] Apps sin propietario: $($r.AppsWithoutOwners.Count)"
+}
 ```
 
 ## 🌐 Reconocimiento Externo (O365)

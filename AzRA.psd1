@@ -53,6 +53,8 @@ FunctionsToExport = @(
     'Get-AzRA-KeyVaults',
     # Internal reconnaissance - Virtual Machines
     'Get-AzRA-VirtualMachines',
+    # Internal reconnaissance - Entra ID
+    'Get-AzRA-EntraID',
     # External reconnaissance
     'Invoke-O365EmailValidator'
 )
