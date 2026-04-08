@@ -119,6 +119,8 @@ Get-AzRA-StorageAccounts       -AccessToken $token -OutputPath $CLIENTPATH -Scan
 Get-AzRA-KeyVaults             -AccessToken $token -OutputPath $CLIENTPATH
 Get-AzRA-VirtualMachines       -AccessToken $token -OutputPath $CLIENTPATH
 Get-AzRA-ContainerRegistries   -AccessToken $token -OutputPath $CLIENTPATH -ScanRepositories
+Get-AzRA-FunctionApps          -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets -IncludeSlots
+Get-AzRA-APIManagement         -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets
 ```
 
 > Requiere: token ARM (`https://management.azure.com`).
@@ -177,6 +179,12 @@ Get-AzRA-EntraID -GraphToken $graphToken -IncludeMFAReport -IncludeApps -Include
 
 #### API de Azure Management — Container Registry
 - `Get-AzRA-ContainerRegistries` - Enumerar Azure Container Registries, auditar misconfiguraciones de seguridad, obtener tokens ACR de data plane, enumerar repositorios/tags/tamaños e interactuar con imágenes para docker pull
+
+#### API de Azure Management — Function Apps / App Services
+- `Get-AzRA-FunctionApps` - Enumerar Function Apps y App Services, auditar misconfiguraciones de seguridad y extraer app settings en texto claro (connection strings, API keys, client secrets)
+
+#### API de Azure Management — API Management
+- `Get-AzRA-APIManagement` - Enumerar servicios de API Management, auditar configuración de red y protocolos, y extraer subscription keys, named value secrets y credenciales de backends
 
 ### Ejemplos por Función
 
@@ -1675,6 +1683,184 @@ C:\Audit\
         registry.json         # Objeto ARM completo del registry
         diagnostics.json      # Estado de Diagnostic Settings
         repositories.json     # Repos, tags y tamanios (si -ScanRepositories)
+```
+
+#### 19. Get-AzRA-FunctionApps
+
+Enumera todas las Function Apps y App Services, evalúa misconfiguraciones de seguridad a nivel ARM y opcionalmente extrae todas las app settings en texto claro. Es uno de los vectores más rentables en auditorías Azure: las app settings contienen habitualmente connection strings, storage account keys, client secrets de Entra ID, API keys de terceros y tokens hardcodeados.
+
+**Cómo funciona:**
+
+**Checks ARM** (siempre activos):
+- Recupera todas las apps via `Microsoft.Web/sites` (incluye Function Apps, Web Apps y API Apps)
+- Para cada app obtiene la configuración de sitio (`/config/web`) y las auth settings V2 (`/config/authsettingsV2`)
+- Evalúa restricciones IP (`ipSecurityRestrictions`) y acceso SCM/Kudu (`scmIpSecurityRestrictions`)
+- Detecta managed identities y VNet integration
+
+**Extracción de app settings** (`-ScanSecrets`):
+- Llama a `POST /config/appsettings/list` por cada app — endpoint ARM que devuelve todos los pares clave/valor en texto claro
+- Con `-IncludeSlots` repite la extracción en cada slot de staging (producción y staging frecuentemente comparten las mismas secrets con menor restricción de red)
+
+**Checks de seguridad:**
+
+| Severidad | Check | Descripción |
+|---|---|---|
+| Crítico | `HttpsOnlyDisabled` | `httpsOnly != true` — permite tráfico HTTP sin cifrar |
+| Crítico | `AuthDisabled + NoIpRestrictions` | App pública sin autenticación ni restricciones de red |
+| Crítico | `PublicScmAccess` | Consola Kudu accesible públicamente sin restricciones (potencial RCE con publish profile) |
+| Crítico | `HasSecrets` | Se extrajeron app settings en texto claro (`-ScanSecrets`) |
+| Alto | `MinTlsWeak` | TLS mínimo 1.0 o 1.1 |
+| Alto | `FtpEnabled` | FTP no deshabilitado (`ftpsState` no es `Disabled`) |
+| Alto | `RemoteDebuggingEnabled` | Depuración remota activa |
+| Alto | `AlwaysOnDisabled` | Function App sin Always On (cold starts, puede evadir monitoreo) |
+| Alto | `HasManagedIdentity + NoVNet` | Managed Identity sin VNet integration (acceso directo a internet) |
+| Info | `SlotCount` | Número de slots de staging existentes |
+| Info | `VNetIntegrated` | Si la app tiene VNet integration |
+
+**Permisos necesarios:**
+- `Microsoft.Web/sites/read` — base
+- `Microsoft.Web/sites/config/list/action` — para `-ScanSecrets`
+- `Microsoft.Web/sites/slots/read` — para `-IncludeSlots`
+
+**Uso básico:**
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Solo checks de seguridad ARM
+Get-AzRA-FunctionApps -AccessToken $token
+
+# Extracción de app settings (el vector principal)
+Get-AzRA-FunctionApps -AccessToken $token -ScanSecrets -OutputPath 'C:\Audit'
+
+# Con slots de staging
+Get-AzRA-FunctionApps -AccessToken $token -ScanSecrets -IncludeSlots -OutputPath 'C:\Audit'
+```
+
+**Filtrado de resultados:**
+```powershell
+$result = Get-AzRA-FunctionApps -AccessToken $token -ScanSecrets
+
+# Mostrar todas las secrets extraidas
+$result | Where-Object { $_.HasSecrets } | ForEach-Object {
+    Write-Output "=== $($_.AppName) ==="
+    $_.Secrets | ForEach-Object { Write-Output "  $($_.Name) = $($_.Value)" }
+}
+
+# Apps con Kudu público
+$result | Where-Object { $_.PublicScmAccess } |
+    Select-Object AppName, ResourceGroup, DefaultHostName
+
+# Solo Function Apps con auth deshabilitada
+$result | Where-Object { $_.IsFunctionApp -and $_.AuthDisabled } |
+    Select-Object AppName, DefaultHostName, NoIpRestrictions
+
+# Apps con managed identity (mapeo de posibles rutas de escalada)
+$result | Where-Object { $_.HasManagedIdentity } |
+    Select-Object AppName, ManagedIdentityType, ManagedIdentityPrincipalId, VNetIntegrated
+```
+
+**Archivos generados (`-OutputPath`):**
+```
+C:\Audit\
+  AzRA-FunctionApps_<timestamp>.csv           # 1 fila por app, todos los checks booleanos
+  AzRA-FunctionApps-Secrets_<timestamp>.csv   # 1 fila por app setting extraida (si -ScanSecrets)
+  FunctionAppsRawDump\
+    <SubscriptionName>\
+      <AppName>\
+        app.json          # Objeto ARM completo
+        appsettings.json  # App settings raw (si -ScanSecrets)
+        slots.json        # Lista de slots (si -IncludeSlots)
+```
+
+---
+
+#### 20. Get-AzRA-APIManagement
+
+Enumera todos los servicios de Azure API Management, evalúa misconfiguraciones de seguridad y opcionalmente extrae tres categorías de secretos: subscription keys, named values de tipo secret y credenciales de backends. APIM actúa como gateway centralizado y frecuentemente almacena credenciales de todos los servicios backend a los que llama.
+
+**Cómo funciona:**
+
+**Checks ARM** (siempre activos):
+- Lista servicios via `Microsoft.ApiManagement/service`
+- Evalúa `virtualNetworkType` (None/External/Internal) — sin VNet = exposición pública completa
+- Lee `customProperties` para detectar TLS 1.0/1.1, SSL 3.0 y cifrado 3DES
+- Comprueba Diagnostic Settings para verificar si se registran logs
+- El endpoint de gestión directa (puerto 3443) queda expuesto cuando no hay VNet integration
+
+**Extracción de secretos** (`-ScanSecrets`), en orden de valor ofensivo:
+1. **Named Values secretos**: enumera todos los Named Values con `secret=true` y llama a `listValue` por cada uno — contienen API keys, tokens y passwords usados en políticas del gateway
+2. **Subscription Keys**: lista todas las suscripciones APIM y llama a `listSecrets` para obtener `primaryKey` y `secondaryKey` — permiten llamar a las APIs publicadas
+3. **Backend credentials**: enumera todos los backends y extrae credenciales de `authorization` (basic auth) y headers personalizados (frecuentemente `Authorization: Bearer <token>`)
+
+**Checks de seguridad:**
+
+| Severidad | Check | Descripción |
+|---|---|---|
+| Crítico | `PublicNetworkEnabled` | `virtualNetworkType = None` — gateway expuesto sin VNet |
+| Crítico | `DirectMgmtEndpointOpen` | Puerto 3443 accesible desde internet (sin VNet) |
+| Crítico | `DeveloperPortalEnabled` | Developer portal accesible públicamente |
+| Crítico | `HasSecrets` | Se extrajeron secretos (`-ScanSecrets`) |
+| Alto | `LegacyProtocolsEnabled` | TLS 1.0, TLS 1.1 o SSL 3.0 habilitados |
+| Alto | `WeakCiphersEnabled` | Cifrado 3DES habilitado |
+| Alto | `SkuConsumption` | SKU Consumption sin soporte para VNet integration |
+| Alto | `DiagnosticLogsDisabled` | Sin Diagnostic Settings configurados |
+| Info | `HasCustomDomains` | Dominios personalizados configurados |
+| Info | `VirtualNetworkType` | Tipo de integración de red (None/External/Internal) |
+
+**Permisos necesarios:**
+- `Microsoft.ApiManagement/service/read` — base
+- `Microsoft.ApiManagement/service/subscriptions/listSecrets/action` — subscription keys
+- `Microsoft.ApiManagement/service/namedValues/listValue/action` — named value secrets
+- `microsoft.insights/diagnosticSettings/read` — opcional
+
+**Uso básico:**
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Solo checks de seguridad ARM
+Get-AzRA-APIManagement -AccessToken $token
+
+# Extracción completa de secretos
+Get-AzRA-APIManagement -AccessToken $token -ScanSecrets -OutputPath 'C:\Audit'
+```
+
+**Filtrado de resultados:**
+```powershell
+$result = Get-AzRA-APIManagement -AccessToken $token -ScanSecrets
+
+# Ver todos los secretos extraidos por tipo
+$result | Where-Object { $_.HasSecrets } | ForEach-Object {
+    Write-Output "=== $($_.ServiceName) - $($_.SecretCount) secretos ==="
+    $_.Secrets | Format-Table SecretType, Name, Value
+}
+
+# Solo named values (API keys de terceros)
+$result | ForEach-Object { $_.Secrets } |
+    Where-Object { $_.SecretType -eq 'NamedValue' } |
+    Format-Table ServiceName, Name, Value
+
+# Subscription keys (para llamar a las APIs publicadas)
+$result | ForEach-Object { $_.Secrets } |
+    Where-Object { $_.SecretType -eq 'SubscriptionKey' } |
+    Format-Table ServiceName, Name, Value
+
+# Servicios con acceso público
+$result | Where-Object { $_.PublicNetworkEnabled } |
+    Select-Object ServiceName, GatewayUrl, ManagementApiUrl, DeveloperPortalUrl, Sku
+```
+
+**Archivos generados (`-OutputPath`):**
+```
+C:\Audit\
+  AzRA-APIManagement_<timestamp>.csv           # 1 fila por servicio, checks booleanos
+  AzRA-APIManagement-Secrets_<timestamp>.csv   # 1 fila por secreto extraido (si -ScanSecrets)
+  APIManagementRawDump\
+    <SubscriptionName>\
+      <ServiceName>\
+        service.json        # Objeto ARM completo del servicio
+        namedValues.json    # Lista de Named Values (sin valores de secretos)
+        subscriptions.json  # Lista de suscripciones APIM
+        backends.json       # Definiciones de backends con credenciales
 ```
 
 ---
