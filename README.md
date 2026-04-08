@@ -121,6 +121,9 @@ Get-AzRA-VirtualMachines       -AccessToken $token -OutputPath $CLIENTPATH
 Get-AzRA-ContainerRegistries   -AccessToken $token -OutputPath $CLIENTPATH -ScanRepositories
 Get-AzRA-FunctionApps          -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets -IncludeSlots
 Get-AzRA-APIManagement         -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets
+Get-AzRA-CosmosDB              -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets
+Get-AzRA-EventHubs             -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets
+Get-AzRA-ManagedIdentities     -AccessToken $token -OutputPath $CLIENTPATH -IncludeSystemAssigned
 ```
 
 > Requiere: token ARM (`https://management.azure.com`).
@@ -185,6 +188,15 @@ Get-AzRA-EntraID -GraphToken $graphToken -IncludeMFAReport -IncludeApps -Include
 
 #### API de Azure Management — API Management
 - `Get-AzRA-APIManagement` - Enumerar servicios de API Management, auditar configuración de red y protocolos, y extraer subscription keys, named value secrets y credenciales de backends
+
+#### API de Azure Management — Cosmos DB
+- `Get-AzRA-CosmosDB` - Enumerar cuentas de Cosmos DB, auditar acceso de red y cifrado, y extraer master keys (acceso total de lectura/escritura a todos los datos)
+
+#### API de Azure Management — Event Hubs
+- `Get-AzRA-EventHubs` - Enumerar namespaces de Event Hubs, auditar firewall y configuración de TLS, y extraer SAS keys por regla de autorización incluyendo las de tipo Manage
+
+#### API de Azure Management — Managed Identities
+- `Get-AzRA-ManagedIdentities` - Enumerar User-Assigned Managed Identities, resolver sus role assignments y mapear rutas de escalada de privilegios (Owner/Contributor/UserAccessAdministrator)
 
 ### Ejemplos por Función
 
@@ -1861,6 +1873,246 @@ C:\Audit\
         namedValues.json    # Lista de Named Values (sin valores de secretos)
         subscriptions.json  # Lista de suscripciones APIM
         backends.json       # Definiciones de backends con credenciales
+```
+
+#### 21. Get-AzRA-CosmosDB
+
+Enumera todas las cuentas de Azure Cosmos DB, evalúa misconfiguraciones de seguridad y opcionalmente extrae las master keys. Las master keys dan acceso de lectura/escritura completo a todos los datos de la cuenta sin necesidad de pasar por RBAC de Azure.
+
+**Cómo funciona:**
+
+Checks ARM (siempre activos):
+- `publicNetworkAccess`: si el acceso público no está explícitamente deshabilitado
+- `ipRules` + `virtualNetworkRules`: si no hay restricciones de red configuradas
+- `disableLocalAuth`: si las master keys están activas (valor `false` = keys disponibles)
+- `keyVaultKeyUri`: si el cifrado usa claves de Microsoft en lugar de CMK
+- Diagnostic Settings para verificar logs de auditoría
+
+Extracción de keys (`-ScanSecrets`):
+- Llama a `POST .../listKeys` y extrae `primaryMasterKey`, `secondaryMasterKey`, `primaryReadonlyMasterKey` y `secondaryReadonlyMasterKey`
+- Si `disableLocalAuth = true`, avisa que solo RBAC está disponible y omite la llamada
+
+**Checks de seguridad:**
+
+| Severidad | Check | Descripción |
+|---|---|---|
+| Crítico | `NoFirewallRules` | Acceso público sin restricciones IP ni VNet |
+| Crítico | `SinPrivateEndpoint` | Cuenta pública sin private endpoint configurado |
+| Crítico | `HasKeys` | Master keys extraídas (acceso total a todos los datos) |
+| Alto | `LocalAuthEnabled` | `disableLocalAuth = false` — keys activas |
+| Alto | `CmkNotConfigured` | Cifrado con claves de Microsoft, no del cliente |
+| Alto | `DiagnosticLogsDisabled` | Sin Diagnostic Settings configurados |
+
+**Permisos necesarios:**
+- `Microsoft.DocumentDB/databaseAccounts/read` — base
+- `Microsoft.DocumentDB/databaseAccounts/listKeys/action` — para `-ScanSecrets`
+
+**Uso:**
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Checks de seguridad ARM
+Get-AzRA-CosmosDB -AccessToken $token
+
+# Con extraccion de master keys
+Get-AzRA-CosmosDB -AccessToken $token -ScanSecrets -OutputPath 'C:\Audit'
+```
+
+**Filtrado de resultados:**
+```powershell
+$result = Get-AzRA-CosmosDB -AccessToken $token -ScanSecrets
+
+# Accounts con acceso publico sin firewall
+$result | Where-Object { $_.NoFirewallRules } |
+    Select-Object AccountName, DocumentEndpoint, LocalAuthEnabled
+
+# Ver keys extraidas
+$result | Where-Object { $_.HasKeys } | ForEach-Object {
+    Write-Output "=== $($_.AccountName) ==="
+    $_.Keys | Format-Table KeyName, KeyValue, DocumentEndpoint
+}
+
+# Conexion directa con la key extraida (ejemplo)
+# $ctx = New-AzCosmosDBContext -Endpoint $result[0].DocumentEndpoint -Key $result[0].Keys[0].KeyValue
+```
+
+**Archivos generados (`-OutputPath`):**
+```
+C:\Audit\
+  AzRA-CosmosDB_<timestamp>.csv        # 1 fila por account, todos los checks
+  AzRA-CosmosDB-Keys_<timestamp>.csv   # 1 fila por key extraida (si -ScanSecrets)
+  CosmosDBRawDump\
+    <SubscriptionName>\
+      <AccountName>\
+        account.json       # Objeto ARM completo
+        keys.json          # Keys raw (si -ScanSecrets)
+        diagnostics.json   # Estado de Diagnostic Settings
+```
+
+---
+
+#### 22. Get-AzRA-EventHubs
+
+Enumera todos los namespaces de Azure Event Hubs, evalúa firewall y configuración de TLS, y opcionalmente extrae las SAS keys (Shared Access Signatures) de todas las reglas de autorización a nivel namespace y por Event Hub individual. Las SAS keys con permiso `Manage` equivalen a acceso de administrador completo.
+
+**Cómo funciona:**
+
+Checks ARM (siempre activos):
+- Lee el `networkRuleSets/default` del namespace para obtener `defaultAction`, `ipRules` y `virtualNetworkRules`
+- Verifica `disableLocalAuth` (SAS keys activas o deshabilitadas)
+- Comprueba `minimumTlsVersion` para detectar TLS 1.0/1.1
+- Verifica SKU: Basic/Standard no soportan private endpoints ni VNet rules completas
+- Recupera Diagnostic Settings
+
+Extracción de SAS keys (`-ScanSecrets`):
+1. Enumera auth rules a nivel namespace y llama a `listkeys` por cada una
+2. Enumera todos los Event Hubs del namespace y repite para sus auth rules individuales
+3. Marca como `IsManage = true` las reglas con permiso `Manage` — permiten leer, escribir y administrar el namespace
+
+**Checks de seguridad:**
+
+| Severidad | Check | Descripción |
+|---|---|---|
+| Crítico | `NoFirewallRules` | Acceso público sin restricciones IP ni VNet (`defaultAction = Allow`) |
+| Crítico | `ManageKeyFound` | SAS key con permiso `Manage` encontrada — acceso de admin completo |
+| Alto | `MinTlsWeak` | TLS mínimo 1.0 o 1.1 |
+| Alto | `BasicOrStandardSku` | SKU Basic/Standard sin soporte completo para VNet ni private endpoints |
+| Alto | `LocalAuthEnabled` | `disableLocalAuth = false` — SAS keys activas |
+| Alto | `DiagnosticLogsDisabled` | Sin Diagnostic Settings configurados |
+| Info | `ZoneRedundant` | Si la redundancia de zona está habilitada |
+
+**Permisos necesarios:**
+- `Microsoft.EventHub/namespaces/read` — base
+- `Microsoft.EventHub/namespaces/authorizationRules/listkeys/action` — para `-ScanSecrets` (namespace level)
+- `Microsoft.EventHub/namespaces/eventhubs/authorizationRules/listkeys/action` — para `-ScanSecrets` (Event Hub level)
+
+**Uso:**
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Checks de seguridad ARM
+Get-AzRA-EventHubs -AccessToken $token
+
+# Con extraccion de SAS keys
+Get-AzRA-EventHubs -AccessToken $token -ScanSecrets -OutputPath 'C:\Audit'
+```
+
+**Filtrado de resultados:**
+```powershell
+$result = Get-AzRA-EventHubs -AccessToken $token -ScanSecrets
+
+# Namespaces con Manage key (maxima severidad)
+$result | Where-Object { $_.ManageKeyFound } |
+    Select-Object NamespaceName, ServiceBusEndpoint
+
+# Ver todas las keys extraidas con sus permisos
+$result | ForEach-Object { $_.Keys } |
+    Select-Object NamespaceName, Scope, RuleName, Rights, IsManage, KeyType, Value |
+    Sort-Object IsManage -Descending | Format-Table
+
+# Solo connection strings (para uso directo)
+$result | ForEach-Object { $_.Keys } |
+    Where-Object { $_.KeyType -match 'ConnectionString' } |
+    Select-Object NamespaceName, Scope, Rights, Value
+```
+
+**Archivos generados (`-OutputPath`):**
+```
+C:\Audit\
+  AzRA-EventHubs_<timestamp>.csv        # 1 fila por namespace, todos los checks
+  AzRA-EventHubs-Keys_<timestamp>.csv   # 1 fila por key extraida con scope y permisos
+  EventHubsRawDump\
+    <SubscriptionName>\
+      <NamespaceName>\
+        namespace.json    # Objeto ARM completo del namespace
+        authRules.json    # Auth rules nivel namespace
+```
+
+---
+
+#### 23. Get-AzRA-ManagedIdentities
+
+Enumera todas las User-Assigned Managed Identities (UAMIs) y resuelve sus role assignments en Azure ARM, identificando rutas de escalada de privilegios. Una identidad con rol `Contributor` o `Owner` a nivel subscripción permite a cualquier recurso que la use ejecutar cualquier operación en todos los recursos de la subscripción.
+
+**Cómo funciona:**
+
+La función opera en dos modos:
+
+**User-Assigned MIs** (siempre):
+- Lista todas las UAMIs via `Microsoft.ManagedIdentity/userAssignedIdentities`
+- Para cada identidad usa su `principalId` para consultar todos los role assignments en la subscripción via `$filter=principalId eq '{id}'`
+- Resuelve el nombre del rol desde la definición ARM (con caché para minimizar llamadas)
+- Clasifica cada role assignment por severidad según rol y scope
+
+**System-Assigned MIs** (`-IncludeSystemAssigned`):
+- Enumera recursos de VMs, Function Apps, Logic Apps y Automation Accounts
+- Extrae el `principalId` de los que tienen `identity.type` conteniendo `SystemAssigned`
+- Resuelve y clasifica sus role assignments con la misma lógica
+
+**Clasificación de roles:**
+
+| Severidad | Rol | Condición |
+|---|---|---|
+| Crítico | `Owner` | A nivel subscription o resource group |
+| Crítico | `Contributor` | A nivel subscription |
+| Crítico | `UserAccessAdministrator` | En cualquier scope (puede asignar cualquier rol) |
+| Alto | `Contributor` | A nivel resource group |
+| Alto | `SecurityAdmin`, `KeyVaultContributor`, `WebsiteContributor` | En cualquier scope |
+| Alto | `StorageAccountContributor`, `LogicAppContributor`, `AutomationContributor` | En cualquier scope |
+
+**Permisos necesarios:**
+- `Microsoft.ManagedIdentity/userAssignedIdentities/read`
+- `Microsoft.Authorization/roleAssignments/read`
+- `Microsoft.Authorization/roleDefinitions/read`
+
+**Uso:**
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Solo User-Assigned MIs
+Get-AzRA-ManagedIdentities -AccessToken $token
+
+# Con System-Assigned MIs y exportacion
+Get-AzRA-ManagedIdentities -AccessToken $token -IncludeSystemAssigned -OutputPath 'C:\Audit'
+```
+
+**Filtrado de resultados:**
+```powershell
+$result = Get-AzRA-ManagedIdentities -AccessToken $token -IncludeSystemAssigned
+
+# Identidades con rutas de escalada criticas
+$result | Where-Object { $_.HasCriticalFindings } | ForEach-Object {
+    Write-Output "=== [$($_.IdentityType)] $($_.IdentityName) ==="
+    $_.RoleAssignments | Where-Object { $_.IsCritical } |
+        Format-Table RoleName, ScopeType, Scope
+}
+
+# Mapa completo de roles por identidad
+$result | ForEach-Object {
+    [PSCustomObject]@{
+        Identity  = $_.IdentityName
+        Type      = $_.IdentityType
+        Roles     = ($_.RoleAssignments | ForEach-Object { "$($_.RoleName)@$($_.ScopeType)" }) -join ' | '
+        Critical  = $_.HasCriticalFindings
+    }
+} | Format-Table -AutoSize
+
+# Identidades con Owner o Contributor a nivel subscripcion (maxima prioridad)
+$result | Where-Object { $_.HasCriticalFindings } |
+    Select-Object IdentityName, IdentityType, RoleCount |
+    Format-Table
+```
+
+**Archivos generados (`-OutputPath`):**
+```
+C:\Audit\
+  AzRA-ManagedIdentities_<timestamp>.csv                  # 1 fila por identidad
+  AzRA-ManagedIdentities-RoleAssignments_<timestamp>.csv  # 1 fila por role assignment
+  ManagedIdentitiesRawDump\
+    <SubscriptionName>\
+      <IdentityName>\
+        identity.json         # Objeto ARM completo de la UAMI
+        roleAssignments.json  # Lista de roles resueltos con severidad
 ```
 
 ---

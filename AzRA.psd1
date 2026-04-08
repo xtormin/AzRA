@@ -55,6 +55,12 @@ FunctionsToExport = @(
     'Get-AzRA-FunctionApps',
     # Internal reconnaissance - API Management
     'Get-AzRA-APIManagement',
+    # Internal reconnaissance - Cosmos DB
+    'Get-AzRA-CosmosDB',
+    # Internal reconnaissance - Event Hubs
+    'Get-AzRA-EventHubs',
+    # Internal reconnaissance - Managed Identities
+    'Get-AzRA-ManagedIdentities',
     # Internal reconnaissance - Key Vault
     'Get-AzRA-KeyVaults',
     # Internal reconnaissance - Virtual Machines
