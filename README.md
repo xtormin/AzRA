@@ -13,14 +13,15 @@ Kit de herramientas PowerShell para reconocimiento y pruebas de seguridad en Azu
    - [Ejemplos de Uso Básico](#ejemplos-de-uso-básico)
 2. [🔐 Autenticación](#-autenticación)
    - [Configuración de Tokens](#configuración-de-tokens)
-3. [📚 Reconocimiento Interno (Azure/M365)](#-reconocimiento-interno-azurem365)
+3. [⚡ Cheatsheet de Auditoría Rápida](#-cheatsheet-de-auditoría-rápida)
+4. [📚 Reconocimiento Interno (Azure/M365)](#-reconocimiento-interno-azurem365)
    - [Funciones Disponibles](#funciones-disponibles)
    - [Ejemplos por Función](#ejemplos-por-función)
    - [Ejemplo de Flujo de Enumeración](#ejemplo-de-flujo-de-enumeración-completo)
-4. [🌐 Reconocimiento Externo (O365)](#-reconocimiento-externo-o365)
+5. [🌐 Reconocimiento Externo (O365)](#-reconocimiento-externo-o365)
    - [Funciones Disponibles](#funciones-disponibles-1)
    - [Ejemplos de Uso](#ejemplos-de-uso)
-5. [📝 Licencia](#-licencia)
+6. [📝 Licencia](#-licencia)
 
 ## 🚀 Inicio Rápido
 
@@ -87,6 +88,52 @@ $azToken = (az account get-access-token --resource https://management.azure.com 
 # Obtener token de Microsoft Graph
 $graphToken = (az account get-access-token --resource https://graph.microsoft.com | ConvertFrom-Json).accessToken
 ```
+
+## ⚡ Cheatsheet de Auditoría Rápida
+
+Secuencia de comandos para cubrir todos los vectores en una auditoría completa de Azure.
+Definir `$CLIENTPATH` antes de empezar:
+
+```powershell
+$CLIENTPATH = "C:\Audits\Cliente_YYYYMMDD"
+```
+
+### 1. Az Module — Deployment History
+
+```powershell
+Connect-AzAccount
+Get-AzRA-DeploymentParameterSecrets -OutputPath $CLIENTPATH -DumpRaw
+```
+
+> Requiere: `Connect-AzAccount` (credenciales interactivas o service principal).
+
+### 2. Azure Management API — Recursos
+
+```powershell
+az login
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+Get-AzRA-AutomationRunbooks    -AccessToken $token -OutputPath $CLIENTPATH
+Get-AzRA-LogicApps             -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets -IncludeVersions
+Get-AzRA-StorageAccounts       -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets
+Get-AzRA-KeyVaults             -AccessToken $token -OutputPath $CLIENTPATH
+Get-AzRA-VirtualMachines       -AccessToken $token -OutputPath $CLIENTPATH
+Get-AzRA-ContainerRegistries   -AccessToken $token -OutputPath $CLIENTPATH -ScanRepositories
+```
+
+> Requiere: token ARM (`https://management.azure.com`).
+
+### 3. Microsoft Graph — Entra ID
+
+```powershell
+$graphToken = (az account get-access-token --resource https://graph.microsoft.com | ConvertFrom-Json).accessToken
+
+Get-AzRA-EntraID -GraphToken $graphToken -IncludeMFAReport -IncludeApps -IncludeConditionalAccess -OutputPath $CLIENTPATH
+```
+
+> Requiere: token Graph (`https://graph.microsoft.com`) con `Directory.Read.All`, `Reports.Read.All`, `Application.Read.All` y `Policy.Read.All`.
+
+---
 
 ## 📚 Reconocimiento Interno (Azure/M365)
 
