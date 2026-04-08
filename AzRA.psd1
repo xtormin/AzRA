@@ -61,6 +61,10 @@ FunctionsToExport = @(
     'Get-AzRA-EventHubs',
     # Internal reconnaissance - Managed Identities
     'Get-AzRA-ManagedIdentities',
+    # Internal reconnaissance - Cognitive Services / AI
+    'Get-AzRA-CognitiveServices',
+    # Internal reconnaissance - Azure DevOps
+    'Get-AzRA-AzureDevOps',
     # Internal reconnaissance - Key Vault
     'Get-AzRA-KeyVaults',
     # Internal reconnaissance - Virtual Machines

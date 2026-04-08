@@ -124,11 +124,22 @@ Get-AzRA-APIManagement         -AccessToken $token -OutputPath $CLIENTPATH -Scan
 Get-AzRA-CosmosDB              -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets
 Get-AzRA-EventHubs             -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets
 Get-AzRA-ManagedIdentities     -AccessToken $token -OutputPath $CLIENTPATH -IncludeSystemAssigned
+Get-AzRA-CognitiveServices     -AccessToken $token -OutputPath $CLIENTPATH -ScanSecrets
 ```
 
 > Requiere: token ARM (`https://management.azure.com`).
 
-### 3. Microsoft Graph — Entra ID
+### 3. Azure DevOps
+
+```powershell
+$devopsToken = (az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 | ConvertFrom-Json).accessToken
+
+Get-AzRA-AzureDevOps -AccessToken $devopsToken -OutputPath $CLIENTPATH -ScanSecrets
+```
+
+> Requiere: token Azure DevOps (`499b84ac-1321-427f-aa17-267ca6975798`) o PAT con scopes `vso.project`, `vso.serviceendpoint`, `vso.variablegroups_read`, `vso.code`, `vso.agentpools`.
+
+### 4. Microsoft Graph — Entra ID
 
 ```powershell
 $graphToken = (az account get-access-token --resource https://graph.microsoft.com | ConvertFrom-Json).accessToken
@@ -197,6 +208,12 @@ Get-AzRA-EntraID -GraphToken $graphToken -IncludeMFAReport -IncludeApps -Include
 
 #### API de Azure Management — Managed Identities
 - `Get-AzRA-ManagedIdentities` - Enumerar User-Assigned Managed Identities, resolver sus role assignments y mapear rutas de escalada de privilegios (Owner/Contributor/UserAccessAdministrator)
+
+#### API de Azure Management — Cognitive Services / AI
+- `Get-AzRA-CognitiveServices` - Enumerar cuentas de Azure Cognitive Services (OpenAI, Speech, Language, Document Intelligence, Computer Vision, etc.) y servicios de Azure AI Search, auditar acceso de red y configuración de seguridad, y extraer API keys
+
+#### Azure DevOps REST API
+- `Get-AzRA-AzureDevOps` - Enumerar organizaciones, proyectos, service connections (con credenciales SPN), variable groups (secretos + Key Vault linked), agent pools self-hosted y repositorios en Azure DevOps
 
 ### Ejemplos por Función
 
@@ -2113,6 +2130,158 @@ C:\Audit\
       <IdentityName>\
         identity.json         # Objeto ARM completo de la UAMI
         roleAssignments.json  # Lista de roles resueltos con severidad
+```
+
+#### 24. Get-AzRA-CognitiveServices
+Enumera todos los recursos de Azure Cognitive Services (proveedor `Microsoft.CognitiveServices/accounts`) y Azure AI Search (proveedor `Microsoft.Search/searchServices`) en todas las suscripciones accesibles. Para cada recurso evalúa la configuración de seguridad y, con `-ScanSecrets`, extrae las API keys en texto claro.
+
+**Recursos cubiertos:**
+- Azure OpenAI (kind: `OpenAI`)
+- Azure AI Search (`Microsoft.Search/searchServices`)
+- Speech Service (kind: `SpeechServices`)
+- Language / Text Analytics (kind: `TextAnalytics`)
+- Document Intelligence / Form Recognizer (kind: `FormRecognizer`)
+- Content Safety (kind: `ContentSafety`)
+- Computer Vision (kind: `ComputerVision`)
+- Azure AI services (kind: `CognitiveServices`)
+- Bing Search (kind: `Bing.Search.v7`)
+
+**Checks de seguridad:**
+
+| Severidad | Check | Descripción |
+|-----------|-------|-------------|
+| Crítico | NoFirewallRules | Acceso público sin restricciones de IP ni VNet |
+| Crítico | ApiKeysFound | API keys extraídas via `listKeys`/`listAdminKeys` |
+| Alto | NoPrivateEndpoint | Sin private endpoint configurado |
+| Alto | LocalAuthEnabled | Keys activas (`disableLocalAuth=false`) |
+| Alto | OutboundNotRestricted | El servicio puede hacer llamadas salientes sin restricción |
+| Alto | DiagnosticLogsDisabled | Sin Diagnostic Settings configurados |
+| Alto | NoCustomerManagedKey | Cifrado con clave de Microsoft, no del cliente |
+
+**Extracción de keys:**
+- Cognitive Services: POST `listKeys` → `key1`, `key2`
+- AI Search: POST `listAdminKeys` → `primaryKey`, `secondaryKey`
+- Si `disableLocalAuth=true`, las keys están deshabilitadas (solo RBAC) y no se intentan extraer
+
+**Permisos requeridos:**
+```
+Microsoft.CognitiveServices/accounts/read
+Microsoft.CognitiveServices/accounts/listKeys/action  (solo -ScanSecrets)
+Microsoft.Search/searchServices/read
+Microsoft.Search/searchServices/listAdminKeys/action  (solo -ScanSecrets)
+microsoft.insights/diagnosticSettings/read            (opcional)
+```
+
+**Uso básico:**
+```powershell
+$token = (az account get-access-token --resource https://management.azure.com | ConvertFrom-Json).accessToken
+
+# Solo auditoría de configuración
+Get-AzRA-CognitiveServices -AccessToken $token
+
+# Con extracción de keys
+Get-AzRA-CognitiveServices -AccessToken $token -ScanSecrets -OutputPath 'C:\Audit'
+
+# Suscripción específica
+Get-AzRA-CognitiveServices -AccessToken $token -SubscriptionId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' -ScanSecrets
+```
+
+**Inspeccionar keys extraídas:**
+```powershell
+$result = Get-AzRA-CognitiveServices -AccessToken $token -ScanSecrets
+$result | Where-Object { $_.HasKeys } | ForEach-Object {
+    Write-Output "=== $($_.AccountName) [$($_.Kind)] ==="
+    $_.Keys | Format-Table KeyName, KeyValue
+}
+```
+
+**Salida CSV generada:**
+```
+AzRA-CognitiveServices_<timestamp>.csv          # 1 fila por servicio
+AzRA-CognitiveServices-Keys_<timestamp>.csv     # 1 fila por key (solo con -ScanSecrets)
+CognitiveServicesRawDump\
+  <SubscriptionName>\
+    <AccountName>\
+      account.json    # Objeto ARM completo
+      keys.json       # Keys extraídas (si -ScanSecrets)
+```
+
+---
+
+#### 25. Get-AzRA-AzureDevOps
+Enumera organizaciones, proyectos, service connections, variable groups, agent pools y repositorios de Azure DevOps via la REST API (`dev.azure.com`). Identifica configuraciones de alto valor ofensivo como conexiones SPN a Azure, secretos en pipelines y agentes self-hosted como vectores de movimiento lateral.
+
+**Recursos enumerados:**
+- Organizations accesibles (via `app.vssps.visualstudio.com`)
+- Proyectos en cada organización (visibilidad pública/privada)
+- Service connections por proyecto (clasificados por tipo y esquema de auth)
+- Variable groups por proyecto (con conteo de secretos y referencias a Key Vault)
+- Agent pools org-level (self-hosted vs. Microsoft-hosted)
+- Repositorios Git (inventario con URLs)
+
+**Checks de seguridad:**
+
+| Severidad | Check | Descripción |
+|-----------|-------|-------------|
+| Crítico | AzureRM-SPN | Service connection de tipo `azurerm` con scheme `ServicePrincipal` |
+| Crítico | KeyVaultLinkedGroup | Variable group de tipo `AzureKeyVault` (revela qué secretos del KV usa el pipeline) |
+| Alto | ExternalServiceConnection | Cualquier conexión a GitHub, AWS, Docker Registry, HTTP genérico |
+| Alto | SecretVariables | Variable group con variables marcadas como secretas (`isSecret=true`) |
+| Alto | SelfHostedPool | Agent pool self-hosted (pivoting, SSRF, acceso a red interna) |
+| Alto | PublicProject | Proyecto con visibilidad pública (accesible sin autenticación) |
+
+**Tokens de acceso:**
+```powershell
+# Azure AD Bearer token para DevOps (recomendado)
+$devopsToken = (az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 | ConvertFrom-Json).accessToken
+
+# Personal Access Token (PAT) - usar con -TokenIsPAT
+# Scopes necesarios: vso.project, vso.serviceendpoint, vso.variablegroups_read, vso.code, vso.agentpools
+```
+
+**Uso básico:**
+```powershell
+# Enumerar todo (descubrimiento automático de orgs)
+Get-AzRA-AzureDevOps -AccessToken $devopsToken
+
+# Con extracción de parámetros de auth en service connections
+Get-AzRA-AzureDevOps -AccessToken $devopsToken -ScanSecrets -OutputPath 'C:\Audit'
+
+# Organización específica con PAT
+Get-AzRA-AzureDevOps -AccessToken 'mypatvalue' -TokenIsPAT -Organization 'myorg' -ScanSecrets
+
+# Proyecto específico
+Get-AzRA-AzureDevOps -AccessToken $devopsToken -Organization 'myorg' -Project 'myproject' -ScanSecrets
+```
+
+**Inspeccionar resultados:**
+```powershell
+$result = Get-AzRA-AzureDevOps -AccessToken $devopsToken -ScanSecrets
+
+# Service connections críticas con sus parámetros
+$result.ServiceConnections | Where-Object { $_.HasCriticalFindings } |
+    Format-Table Organization, Project, ConnectionName, Scheme, AuthParams
+
+# Variable groups con secretos
+$result.VariableGroups | Where-Object { $_.HasCriticalFindings -or $_.HasHighFindings } |
+    Format-Table Organization, Project, GroupName, KeyVaultName, SecretCount
+
+# Agentes self-hosted
+$result.AgentPools | Where-Object { $_.IsSelfHosted } |
+    Format-Table Organization, PoolName, AgentCount
+```
+
+**Salida CSV generada:**
+```
+AzRA-AzDevOps-ServiceConnections_<timestamp>.csv   # 1 fila por service connection
+AzRA-AzDevOps-VariableGroups_<timestamp>.csv       # 1 fila por variable group
+AzRA-AzDevOps-AgentPools_<timestamp>.csv           # 1 fila por agent pool
+AzRA-AzDevOps-Repos_<timestamp>.csv               # 1 fila por repositorio
+AzureDevOpsRawDump\
+  <OrgName>\
+    <ProjectName>\
+      serviceConnections.json    # Lista completa de service connections
+      variableGroups.json        # Lista completa de variable groups
 ```
 
 ---
