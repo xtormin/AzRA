@@ -320,11 +320,11 @@ function Get-AzRA-ContainerRegistries {
             try {
                 $diagSettings = Invoke-AzRARequest `
                     -Uri "https://management.azure.com/$($registry.id)/providers/microsoft.insights/diagnosticSettings?api-version=2021-05-01-preview" `
-                    -AccessToken $AccessToken -Method GET
+                    -AccessToken $AccessToken -Method GET -ErrorAction Stop
                 $diagLogsDisabled = ($null -eq $diagSettings -or @($diagSettings).Count -eq 0)
             }
             catch {
-                Write-Verbose "    Could not retrieve diagnostic settings for $regName"
+                Write-Verbose "    Sin acceso a diagnostic settings para $regName"
             }
 
             # Admin credentials (only if admin user enabled)
@@ -333,14 +333,14 @@ function Get-AzRA-ContainerRegistries {
                 try {
                     $creds = Invoke-AzRARequest `
                         -Uri "https://management.azure.com/subscriptions/$subId/resourceGroups/$rgName/providers/Microsoft.ContainerRegistry/registries/$regName/listCredentials?api-version=2023-07-01" `
-                        -AccessToken $AccessToken -Method POST
+                        -AccessToken $AccessToken -Method POST -ErrorAction Stop
                     if ($creds -and $creds.username) {
                         $adminUsername = $creds.username
                         Write-Host "    [!] Admin credentials obtenidas: $adminUsername" -ForegroundColor Red
                     }
                 }
                 catch {
-                    Write-Verbose "    Could not retrieve admin credentials for $regName"
+                    Write-Warning "    [403] Sin permiso para listCredentials en $regName (requiere listCredentials/action)"
                 }
             }
 
@@ -436,9 +436,23 @@ function Get-AzRA-ContainerRegistries {
             $hasHigh     = ($noFirewallRules -or $retentionDisabled -or $contentTrustDis -or
                            ($diagLogsDisabled -eq $true) -or $basicSku)
 
-            if ($hasCritical) { Write-Host "    [!] CRITICO: $regName" -ForegroundColor Red }
-            elseif ($hasHigh) { Write-Host "    [!] ALTO: $regName" -ForegroundColor Yellow }
-            else              { Write-Host "    [OK] $regName" -ForegroundColor Green }
+            if ($hasCritical) {
+                Write-Host "    [!] CRITICO: $regName" -ForegroundColor Red
+                if ($anonymousPull)    { Write-Host "        - AnonymousPullEnabled: cualquier usuario puede hacer pull sin autenticacion" -ForegroundColor Red }
+                if ($adminUserEnabled) { Write-Host "        - AdminUserEnabled: credenciales de admin estaticas habilitadas$(if ($adminUsername) { " ($adminUsername)" })" -ForegroundColor Red }
+                if ($publicNetEnabled) { Write-Host "        - PublicNetworkAccessEnabled: sin restricciones de red (defaultAction=Allow, sin reglas IP)" -ForegroundColor Red }
+            }
+            elseif ($hasHigh) {
+                Write-Host "    [!] ALTO: $regName" -ForegroundColor Yellow
+                if ($noFirewallRules)              { Write-Host "        - NoFirewallRules: sin reglas de firewall IP configuradas" -ForegroundColor Yellow }
+                if ($retentionDisabled)            { Write-Host "        - RetentionPolicyDisabled: sin politica de retencion de imagenes" -ForegroundColor Yellow }
+                if ($contentTrustDis)              { Write-Host "        - ContentTrustDisabled: firma de imagenes no habilitada" -ForegroundColor Yellow }
+                if ($diagLogsDisabled -eq $true)   { Write-Host "        - DiagnosticLogsDisabled: sin Diagnostic Settings configurados" -ForegroundColor Yellow }
+                if ($basicSku)                     { Write-Host "        - BasicSku: SKU Basic sin soporte para content trust ni private endpoints" -ForegroundColor Yellow }
+            }
+            else {
+                Write-Host "    [OK] $regName" -ForegroundColor Green
+            }
 
             # -- Raw dump ------------------------------------------------------
 
